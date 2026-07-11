@@ -148,7 +148,7 @@ both ground-truth test datasets, with no manual stage-by-stage invocation.*
 | Milestone | Scope | Status |
 |---|---|---|
 | Goalpost 0 — Project plan locked in with Paul | This document + sign-off | Near-complete; awaiting Paul's review |
-| Goalpost 1 — Claude Code CLI adapter proven | Build Stages 1–2 | Stage 1 code written and passing (4/4 checks, native Windows Python); Stage 2 stress test not yet run |
+| Goalpost 1 — Claude Code CLI adapter proven | Build Stages 1–2 | Stage 1 done; Stage 2 stress test run, functionally passing with 2 documented follow-ups (process-leak re-check, novelty-prompt wording) |
 | Goalpost 2 — First end-to-end one-pager | Build Stages 3–8 | Not started |
 | Goalpost 3 — Validate the published/unpublished short-circuit | Build Stage 9 | Not started |
 | Goalpost 4 — Small-batch calibration (~5–10 datasets) | Eval rubric, prompt tuning | Not started |
@@ -185,15 +185,23 @@ on:
 3. A `\begin{IDEA}...\end{IDEA}` multi-line block survives the round-trip intact. ✅ done
 4. Wall-clock latency for a single call measured and judged acceptable for an 8-call idea loop. ✅
    done (~8.8s/call; ~56s+ expected pure overhead for Stage 5's loop)
-5. 10 back-to-back calls complete with no failures or silent truncation. ⬜ not yet run
-6. A hard timeout is enforced and returns/raises cleanly rather than hanging. ⬜ not yet run
+5. 10 back-to-back calls complete with no failures or silent truncation. ✅ done — 10/10 exact PONG
+   matches, P50=10.72s/P95=14.29s, $0.1454 total.
+6. A hard timeout is enforced and returns/raises cleanly rather than hanging. ✅ done, with a
+   caveat — see Stage 2 session log; the leak-detection part of this check is inconclusive, not
+   confirmed clean.
 7. A prompt touching on literature search is checked for unwanted web-search tool use, and a
-   prompt tempting file/tool use still returns plain text headlessly. ⬜ not yet run
+   prompt tempting file/tool use still returns plain text headlessly. ✅ done — web search requires
+   explicit permission and is never auto-triggered; tool-tempting prompt returned plain text with no
+   stall.
 8. The exact invocation flags needed for reliably clean output (including whether `--model`
-   actually pins one model) are documented as the standard call pattern for Stage 5 onward. ⬜ not
-   yet run
+   actually pins one model) are documented as the standard call pattern for Stage 5 onward. ✅ done
+   — `--model` does pin the primary response; see session log for the haiku-side-cost clarification.
 
-Once 5–8 hold (or have documented workarounds), Stages 1–2 are done and Stage 3 can start.
+Stage 2 is functionally done; two follow-up items are open before calling it fully closed (see
+session log): (a) redo the timeout/leak check with a proper before/after process baseline, and (b)
+decide how to word Stage 6's `novelty_prompt` so it doesn't read as a request for a canned verdict.
+Stage 3 can start in parallel with those follow-ups.
 
 ## ALMA input decision — decided, not open
 
@@ -226,6 +234,78 @@ hand-picked real examples** up front rather than one now and a second one later.
    Semantic Scholar call, for reproducibility?
 
 ## Session log
+
+**2026-07-11 — Stage 2 stress test run (`test_stage2.py`, log in `stage2_run_log.txt`)**
+- Fixed a real bug found while building this stage's timeout check: `llm._invoke` previously used
+  `subprocess.run(timeout=...)`, which on Windows only kills the immediate `claude.exe` handle, not
+  any children it spawns. Rewrote it around `Popen` + a `_kill_process_tree` helper that shells out
+  to `taskkill /F /T /PID` on Windows (plain `.kill()` elsewhere) so a timeout can't leak orphans.
+  Re-ran `test_stage1.py` afterward — still 4/4.
+- **Check 1 (10 back-to-back calls):** 10/10 exact `PONG` matches. Latency P50=10.72s, P95=14.29s,
+  min=9.15s, max=14.29s. Total cost $0.1454 for the 10 calls (~$0.0145/call average, higher than
+  Stage 1's original $0.017-for-one estimate divided out — consistent with the CLI-version cost
+  drift already noted in the Stage 1 entry below).
+- **Check 2 (simulated growing-context loop, 4 iters, 274→1466 chars):** wall-clock grew only
+  +5.41s and cost only +$0.0099 across the 4 iterations — i.e., cost/latency scale sub-linearly
+  with prompt size at this scale (dominated by the fixed ~10s CLI overhead, not prompt length).
+  Good news for Stage 5's 8-call idea loop: growing `previous_ideas` context is not expected to
+  blow up cost/latency on its own.
+- **Check 3 (raw-JSON prompt) — important, unexpected:** the test prompt asked Claude to always
+  reply with a canned `{"verdict": "NOT_PUBLISHED", "citations": []}` regardless of any real input.
+  Claude refused outright, explicitly identifying this as looking like a prompt-injection/fake-
+  verdict pattern, and returned prose instead of JSON. **This is a prompt-design finding, not a
+  JSON-parsing finding:** Stage 6's real `novelty_prompt` must always give Claude genuine
+  dataset/context to evaluate and ask it to *determine* the verdict, never request a
+  predetermined/canned answer — doing otherwise risks an outright refusal rather than malformed
+  JSON. The three-fallback JSON-repair path Denario needed may be solving a different problem than
+  this one; re-test check 3 with a genuine (not canned-answer) prompt before trusting the
+  JSON-format failure mode is understood.
+- **Check 4 (loosely-worded prompt) — important, unexpected:** the response opened with
+  unprompted meta-commentary noting the prompt was "copied verbatim from `test_stage2.py:128-130`"
+  before answering. **This means a headless `claude -p` call invoked from within a project
+  directory is not a pure stateless prompt→text function** — it appears to have situational
+  awareness of (or read) the surrounding project's files/context rather than treating the prompt
+  as isolated text. This directly threatens the "zero side effects" assumption `call_claude` was
+  designed around and needs a decision before Stage 5: either (a) always invoke `claude -p` from an
+  isolated/empty working directory to force statelessness, or (b) accept and document that ambient
+  project context can leak into responses and design prompts defensively around that. **Flagging
+  for your review — this is the single most consequential finding from this stress test.**
+- **Check 5 (hard timeout):** timeout enforcement itself passed cleanly — raised
+  `ClaudeCLIError` ~6s after a 2s timeout was set (the extra ~4s is `taskkill`'s own overhead), no
+  hang. The process-tree leak check is **inconclusive**: `tasklist` showed 10 `claude.exe`
+  processes still running afterward, but the test took no baseline snapshot before the run, so
+  there's no way to tell how many of those 10 pre-existed (e.g. this very interactive session is
+  itself a `claude.exe` process, as may be an IDE extension host) versus how many were actually
+  leaked by the killed subprocess. **Follow-up needed:** re-run with a `tasklist` snapshot taken
+  before Check 1 even starts, diff against the post-timeout snapshot, and only count genuinely new
+  PIDs as leaks.
+- **Check 6 (tool-tempting prompt):** returned plain text ("`secret_notes.txt` doesn't exist")
+  with no stall or permission-prompt hang; `num_turns=2` suggests one internal tool-check turn
+  happened but resolved headlessly as expected.
+- **Check 7 (web-search trigger) — resolves an open question from Stage 1's addendum:** contrary
+  to the earlier inference that headless Claude Code has web search "available by default," the
+  literature-flavored prompt got an explicit "I don't have permission to use web search right now"
+  response — web search requires an explicit grant and is **not** auto-invoked headlessly, and
+  critically it does not stall waiting for permission, it just says so in text. This is good news
+  for Stage 6 reproducibility: the novelty-check won't accidentally go out to the live web
+  non-deterministically unless we explicitly grant that permission.
+- **Check 8 (`--model` pinning) — resolves the other open question from Stage 1's addendum:**
+  `--model claude-haiku-4-5` produces `modelUsage` billing for *only* haiku. Passing no `--model`
+  or `--model claude-sonnet-5` both bill sonnet for the actual reply *plus* a small fixed
+  `claude-haiku-4-5-20251001` side-charge (526 input/~15 output tokens, ~$0.0006) that appears to be
+  a fixed internal overhead (e.g. conversation-title generation) rather than uncontrolled routing
+  of the primary answer. **Conclusion: `--model` does reliably pin the primary generation**; the
+  earlier "two models billed in one call" observation was this fixed side-cost, not routing
+  uncertainty, and it should be included in per-call cost budgeting regardless of which model is
+  requested.
+- **Check 9 (realistic-sized prompt budget):** a genuine 705-char dataset-description-style prompt
+  cost $0.0722 and took 17.97s wall-clock (10.2s of which was actual generation) — noticeably more
+  than the trivial PONG case ($0.01–0.06, ~10-14s). Budgeting Stage 5's 8-call idea loop off this
+  number instead: roughly $0.4–0.6 and 2–3 minutes total, which is comfortably tolerable.
+- **Net effect on the plan:** items 5–8 of the "eight items" checklist above are now done, two with
+  documented caveats (leak re-check, novelty-prompt wording) rather than fully clean passes. Stage 3
+  can start; the two caveats should be resolved before Stage 6 specifically (novelty check) is
+  built, since both concerns are most relevant there.
 
 **2026-07-11 — Stage 1 implemented and verified as code**
 - Project moved to its own standalone repo/folder, `alma-thesis-planner`, outside `Denario-fork`
