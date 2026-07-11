@@ -18,6 +18,18 @@ class ClaudeCLIError(RuntimeError):
     """Raised when the `claude` CLI exits non-zero or returns unparseable output."""
 
 
+# Headless `claude -p` keeps full agentic tool access by default (Read/Glob/Bash on
+# the cwd, an auto-memory check against the project's own memory/MEMORY.md, and
+# spontaneous WebSearch attempts) even for prompts that never asked for any of it.
+# This breaks call_claude's stateless prompt-in/text-out contract, non-deterministically
+# (confirmed via investigate_ambient_context.py: identical prompts sometimes read local
+# files unprompted, sometimes don't). Denying these tools explicitly is the fix -- a
+# blanket `--tools ""` was tried first and rejected: it still lets the model *attempt*
+# a now-blocked tool call, and the broken attempt leaks into the response text instead
+# of being disabled cleanly.
+DEFAULT_DISALLOWED_TOOLS = ["Read", "Glob", "Grep", "Bash", "WebSearch", "WebFetch", "Write", "Edit"]
+
+
 @dataclass
 class ClaudeResult:
     text: str
@@ -49,11 +61,19 @@ def _kill_process_tree(proc: subprocess.Popen) -> None:
         proc.kill()
 
 
-def _invoke(prompt: str, *, timeout: float = 120, model: str | None = None) -> ClaudeResult:
+def _invoke(
+    prompt: str,
+    *,
+    timeout: float = 120,
+    model: str | None = None,
+    disallowed_tools: list[str] | None = DEFAULT_DISALLOWED_TOOLS,
+) -> ClaudeResult:
     claude_exe = _resolve_claude_exe()
     cmd = [claude_exe, "-p", prompt, "--output-format", "json"]
     if model is not None:
         cmd += ["--model", model]
+    if disallowed_tools:
+        cmd += ["--disallowedTools", *disallowed_tools]
 
     start = time.monotonic()
     proc = subprocess.Popen(
@@ -98,6 +118,18 @@ def _invoke(prompt: str, *, timeout: float = 120, model: str | None = None) -> C
     )
 
 
-def call_claude(prompt: str, *, timeout: float = 120, model: str | None = None) -> str:
-    """Send `prompt` to Claude via the headless CLI and return the response text."""
-    return _invoke(prompt, timeout=timeout, model=model).text
+def call_claude(
+    prompt: str,
+    *,
+    timeout: float = 120,
+    model: str | None = None,
+    disallowed_tools: list[str] | None = DEFAULT_DISALLOWED_TOOLS,
+) -> str:
+    """Send `prompt` to Claude via the headless CLI and return the response text.
+
+    By default, denies Read/Glob/Grep/Bash/WebSearch/WebFetch/Write/Edit so the call
+    behaves as a stateless prompt-in/text-out function rather than a full agent with
+    ambient access to the calling directory. Pass disallowed_tools=None to restore
+    default (unrestricted) tool access.
+    """
+    return _invoke(prompt, timeout=timeout, model=model, disallowed_tools=disallowed_tools).text

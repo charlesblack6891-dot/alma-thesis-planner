@@ -235,6 +235,49 @@ hand-picked real examples** up front rather than one now and a second one later.
 
 ## Session log
 
+**2026-07-11 — Ambient-context finding chased down and fixed
+(`investigate_ambient_context.py`, `verify_ambient_context_fix.py`)**
+- Follow-up on Stage 2 Check 4's "the model referenced `test_stage2.py:128-130` unprompted"
+  finding. Ran 6 targeted experiments to isolate the cause rather than guess:
+  1. **Root cause confirmed directly.** With `--tools ""` (meant to disable everything), the raw
+     attempted command leaked straight into the response text: `powershell type
+     C:\Users\cb447\.claude\projects\...\alma-thesis-planner\memory\MEMORY.md 2>nul || echo NONE`.
+     The headless `claude -p` subprocess runs as a full Claude Code agent — the same system this
+     assistant runs as — which by default (a) keeps Read/Glob/Bash tool access to the cwd, (b) has
+     a built-in habit of checking a per-project `memory/MEMORY.md` for prior context before
+     answering, and (c) will spontaneously attempt a `WebSearch` even when the prompt never asked
+     for literature (confirmed separately: a plain "give me a thesis idea" prompt triggered a denied
+     `WebSearch` for "ALMA NGC 1365 CO molecular gas gravity torques inflow AGN circumnuclear disk").
+     None of this was something the wrapper opted into.
+  2. **Not a cross-project memory leak, for now.** The `alma-thesis-planner` project's own
+     `.claude/projects/.../memory/` directory is currently empty, so nothing was actually leaked
+     *from* memory in these tests — but the mechanism is real and would start injecting persisted
+     context into supposedly-stateless calls the moment that file gets populated (e.g., if `claude`
+     is ever run interactively from this directory). Forward-looking risk, not fixed by anything
+     below — worth re-checking once real project work starts happening in this directory
+     interactively.
+  3. **Non-deterministic.** The identical prompt, identical directory, identical tool settings
+     sometimes triggered file-reading/tool-use behavior and sometimes didn't across repeated runs —
+     a real, repeatable failure mode, not a guaranteed one.
+  4. **`--bare` ruled out.** Confirmed it hard-fails (exit 1) when only an OAuth CLI login is
+     present — it requires `ANTHROPIC_API_KEY`/`apiKeyHelper` and never reads the OAuth session or
+     keychain, which is incompatible with this project's zero-API-key design constraint.
+  5. **Blanket `--tools ""` rejected as the fix.** It doesn't cleanly disable tool use — the model
+     still *attempts* a now-blocked tool call and the broken attempt (raw shell-command text) leaks
+     into the final response instead of being suppressed.
+  6. **Fix: explicit `--disallowedTools` deny-list.** `--disallowedTools Read Glob Grep Bash
+     WebSearch WebFetch` produced a clean, direct answer with `permission_denials=[]` and no
+     meta-commentary. Verified this holds repeatably, not just once: 5/5 repeated runs of the exact
+     ambient-context-triggering prompt came back clean (no file/tool references) through
+     `call_claude`'s new default.
+- **Fix applied to `llm.py`:** added `DEFAULT_DISALLOWED_TOOLS = ["Read", "Glob", "Grep", "Bash",
+  "WebSearch", "WebFetch", "Write", "Edit"]`, passed as `--disallowedTools` by default in both
+  `_invoke` and `call_claude` (overridable via a `disallowed_tools` kwarg, `None` to restore
+  unrestricted access). Re-ran `test_stage1.py` afterward — still 4/4, confirming the deny-list
+  doesn't break ordinary text generation.
+- **Still open:** re-check the memory-leak risk (item 2 above) once this directory has real
+  interactive `claude` usage in it, not just subprocess calls from the wrapper.
+
 **2026-07-11 — Stage 2 stress test run (`test_stage2.py`, log in `stage2_run_log.txt`)**
 - Fixed a real bug found while building this stage's timeout check: `llm._invoke` previously used
   `subprocess.run(timeout=...)`, which on Windows only kills the immediate `claude.exe` handle, not
