@@ -76,6 +76,19 @@ malformed output predictably, and a file round-trips through write/read with no 
 - **Verification:** well-formed input extracts cleanly; malformed input (missing closing tag)
   triggers the fallback path predictably rather than crashing; a file round-trips byte-identical
   through the write/read helpers.
+  **Done — code written and passing.** `blocks.py` (`extract_block`, `BlockExtractionError`) and
+  `state.py` (`read_state_file`, `write_state_file`, following `denario/config.py`'s
+  `input_files/`+filename convention) now exist at the repo root, plus `test_stage3.py`. Unlike
+  Stage 1/2's tests, this suite makes **zero live `claude` CLI calls** — the repair-fallback path
+  is exercised via a `repair_fn` dependency-injection parameter on `extract_block` (defaults to
+  `call_claude`, overridable for tests), so it's free and deterministic to run. 6/6 checks passed
+  (well-formed extraction, malformed+`repair=False` raises, malformed+fake-repair-success uses the
+  repaired output, malformed+fake-repair-failure still raises cleanly, file round-trip, and
+  `input_files/` auto-creation). Also wrote `paul_check.py`, the concrete one-command script named
+  in Paul's Goalpost-1 pass/fail check (prompt-template → `call_claude` → `extract_block` →
+  `write_state_file`, run twice unattended) — compiles and imports cleanly but **has not yet been
+  run live** (it makes real, cost-incurring CLI calls; deliberately not run without checking in
+  first — see session log).
 
 ### Stage 4 — Example dataset → `data_description.md`
 *Purpose: get one real ALMA dataset's metadata into the pipeline's input format for the first time.
@@ -148,8 +161,8 @@ both ground-truth test datasets, with no manual stage-by-stage invocation.*
 | Milestone | Scope | Status |
 |---|---|---|
 | Goalpost 0 — Project plan locked in with Paul | This document + sign-off | Near-complete; awaiting Paul's review |
-| Goalpost 1 — Claude Code CLI adapter proven | Build Stages 1–2 | Stage 1 done; Stage 2 stress test run, functionally passing with 2 documented follow-ups (process-leak re-check, novelty-prompt wording) |
-| Goalpost 2 — First end-to-end one-pager | Build Stages 3–8 | Not started |
+| Goalpost 1 — Claude Code CLI adapter proven | Build Stages 1–2 | **Closed.** Stages 1–2 done; Paul's named pass/fail check (`paul_check.py`) run live and passed 2026-07-17. 2 minor follow-ups remain open (process-leak re-check, novelty-prompt wording) but don't block Goalpost 2 — most relevant to Stage 6 specifically |
+| Goalpost 2 — First end-to-end one-pager | Build Stages 3–8 | Stage 3 done; Stages 4–8 not started |
 | Goalpost 3 — Validate the published/unpublished short-circuit | Build Stage 9 | Not started |
 | Goalpost 4 — Small-batch calibration (~5–10 datasets) | Eval rubric, prompt tuning | Not started |
 | Goalpost 5 — Automated ingestion | `astroquery.alma` or NRAO's layer, triggered by need | Not started |
@@ -234,6 +247,38 @@ hand-picked real examples** up front rather than one now and a second one later.
    Semantic Scholar call, for reproducibility?
 
 ## Session log
+
+**2026-07-17 — Continuity check + Stage 3 built (`blocks.py`, `state.py`, `test_stage3.py`,
+`paul_check.py`)**
+- Picked this project back up in a fresh session. Located the real project directory
+  (`alma-thesis-planner`, sibling to `Denario-fork` — the fork itself was untouched, consistent
+  with the standalone-tool decision in `PROJECT_BRIEF.md`) and confirmed the repo was clean and
+  fully committed through the Stage 2 ambient-context fix (commit `37b9633`).
+- Before writing new code, statically verified all existing code is intact and usable without
+  making any live API calls: `python -m py_compile` on `llm.py`, `test_stage1.py`,
+  `test_stage2.py`, `investigate_ambient_context.py`, `verify_ambient_context_fix.py` all
+  compiled clean, and `import llm` succeeded. Did not re-run the live-CLI test suites
+  (`test_stage1.py`/`test_stage2.py`) to avoid incurring real cost on a routine continuity check —
+  deferred to whenever a live-CLI verification is actually wanted.
+- Built Stage 3 per `BUILD_PLAN.md`/`PLAN.md`'s spec: `blocks.py::extract_block` (ported from
+  Denario's `extract_latex_block`/`fixer`) and `state.py::read_state_file`/`write_state_file`
+  (following `denario/config.py`'s `input_files/`+filename convention exactly). Designed
+  `extract_block`'s repair fallback with an injectable `repair_fn` parameter specifically so
+  `test_stage3.py` could exercise both the happy path and the repair-fallback path with zero live
+  `claude` calls — 6/6 checks passed, $0 cost.
+- Wrote `paul_check.py`: the exact one-command script named in Paul's Goalpost-1 pass/fail check
+  (prompt-template → `call_claude` → `extract_block` → `write_state_file`, run twice unattended).
+  **Run live and passed.** Both runs completed unattended with no manual intervention, each wrote a
+  non-empty, well-formed `idea.md` (run 1: 412 chars, run 2: 535 chars — run 2 overwrote run 1's
+  file at the same path, as expected since `write_state_file` always targets the same filename).
+  Spot-checked run 2's output by hand, not just for non-emptiness: a coherent, correctly-scoped
+  thesis idea (archival ALMA Band 6 continuum + CO(2-1) analysis of NGC 1365's circumnuclear gas,
+  compared against AGN torus orientation from the literature, explicitly scoped to "one semester").
+  **Goalpost 1 is now fully closed** — all 8 itemized checks plus Paul's own named pass/fail check
+  are done.
+- **Next action:** Stage 4 — source the one real example ALMA dataset's metadata and fill in
+  `data_description.md`, kicking off Goalpost 2. The two Stage 2 follow-ups (process-leak
+  re-baseline, `novelty_prompt` wording) remain open, most relevant to Stage 6, not blocking here.
 
 **2026-07-11 — Ambient-context finding chased down and fixed
 (`investigate_ambient_context.py`, `verify_ambient_context_fix.py`)**
