@@ -1,3 +1,4 @@
+
 """One-off investigation: why did a headless `claude -p` call reference the
 local test_stage2.py file by name and line number, unprompted, when the prompt
 gave it no reason to? This isn't part of the Stage 2 test suite -- it's a

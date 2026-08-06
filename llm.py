@@ -18,6 +18,10 @@ class ClaudeCLIError(RuntimeError):
     """Raised when the `claude` CLI exits non-zero or returns unparseable output."""
 
 
+class ChatGPTNotImplementedError(RuntimeError):
+    """Raised by call_chatgpt -- see its docstring."""
+
+
 # Headless `claude -p` keeps full agentic tool access by default (Read/Glob/Bash on
 # the cwd, an auto-memory check against the project's own memory/MEMORY.md, and
 # spontaneous WebSearch attempts) even for prompts that never asked for any of it.
@@ -69,7 +73,15 @@ def _invoke(
     disallowed_tools: list[str] | None = DEFAULT_DISALLOWED_TOOLS,
 ) -> ClaudeResult:
     claude_exe = _resolve_claude_exe()
-    cmd = [claude_exe, "-p", prompt, "--output-format", "json"]
+    # The prompt is piped over stdin rather than passed as a "-p <prompt>"
+    # command-line argument -- confirmed live that a long prompt as an argv
+    # element (tens of thousands of characters, e.g. a late idea-loop
+    # iteration with several rounds of accumulated context) raises
+    # `OSError: [WinError 206] The filename or extension is too long` on
+    # Windows. `-p`/`--print` alone (no positional prompt) reads from stdin,
+    # confirmed working via `echo ... | claude -p --output-format json`,
+    # and stdin has no comparable length limit.
+    cmd = [claude_exe, "-p", "--output-format", "json"]
     if model is not None:
         cmd += ["--model", model]
     if disallowed_tools:
@@ -78,7 +90,7 @@ def _invoke(
     start = time.monotonic()
     proc = subprocess.Popen(
         cmd,
-        stdin=subprocess.DEVNULL,
+        stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -86,7 +98,7 @@ def _invoke(
         shell=False,
     )
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = proc.communicate(input=prompt, timeout=timeout)
     except subprocess.TimeoutExpired:
         _kill_process_tree(proc)
         proc.wait()
@@ -133,3 +145,20 @@ def call_claude(
     default (unrestricted) tool access.
     """
     return _invoke(prompt, timeout=timeout, model=model, disallowed_tools=disallowed_tools).text
+
+
+def call_chatgpt(prompt: str, *, timeout: float = 120) -> str:
+    """Fallback provider for when the user's Claude usage/tokens are exhausted.
+
+    Not implemented yet. Unlike Claude, ChatGPT's free web tier has no official
+    headless/API equivalent of `claude -p` -- calling it for real requires a design
+    decision this repo hasn't made (an OpenAI API key, which is pay-per-token and not
+    actually "the free version"; browser automation of chatgpt.com; or a manual
+    copy/paste relay through a dialog). Raises rather than silently falling back to
+    Claude or fabricating a response, so callers (wizard.py's provider selection)
+    fail loudly instead of pretending this works.
+    """
+    raise ChatGPTNotImplementedError(
+        "ChatGPT support isn't implemented yet -- there's no real call behind this option "
+        "so it can only raise. Switch the provider back to Claude to continue."
+    )

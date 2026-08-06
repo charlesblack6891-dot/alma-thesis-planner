@@ -1,0 +1,5 @@
+VERDICT: NOT_PUBLISHED
+JUSTIFICATION: The Harada et al. 2018 "ALMA Astrochemical Observations of the Infrared-luminous Merger NGC 3256" paper (results #1 and #4) is by the same PI and target, but it describes a spectral-scan survey covering "most of the 3 and 1.3 mm bands" for general multispecies chemistry — a different observational setup than this project's targeted Band 5/6/7 HCN/HCO+ excitation-ladder outflow study — and was published in 2018, before this project's data were even made public (2019-04-16), so it cannot be reporting on this dataset. No other result addresses the specific HCN(2-1,3-2,4-3)/HCO+ LVG dense-gas-outflow analysis described in this proposal.
+CITATIONS:
+1. "ALMA Astrochemical Observations of the Infrared-luminous Merger NGC 3256" (2018) -- N. Harada, K. Sakamoto, S. Martín, S. Aalto, R. Aladro, K. Śliwa -- https://www.semanticscholar.org/paper/3f8da7a36c85efd2a4b09d6d92137736ccd850a9 (same PI/target but different, earlier dataset — not this project)
+2. (no other results directly relevant)

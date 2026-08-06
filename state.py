@@ -10,15 +10,34 @@ from __future__ import annotations
 from pathlib import Path
 
 INPUT_FILES_DIRNAME = "input_files"
+RAW_DATA_DIRNAME = "raw_data"
+FIGURES_DIRNAME = "figures"
 
 DESCRIPTION_FILE = "data_description.md"
 IDEA_FILE = "idea.md"
 METHODS_FILE = "methods.md"
 LITERATURE_FILE = "literature.md"
+BEGINNER_PLAN_FILE = "beginner_plan.md"
+WRITEUP_FILE = "writeup.md"
+PAPER_FILE = "paper.md"
+FULL_DOCUMENT_FILE = "full_document.md"
+RESULTS_FILE = "results.json"
 
 
 def input_files_dir(project_dir: str | Path) -> Path:
     return Path(project_dir) / INPUT_FILES_DIRNAME
+
+
+def raw_data_dir(project_dir: str | Path) -> Path:
+    path = Path(project_dir) / RAW_DATA_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def figures_dir(project_dir: str | Path) -> Path:
+    path = Path(project_dir) / INPUT_FILES_DIRNAME / FIGURES_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def read_state_file(project_dir: str | Path, filename: str) -> str:

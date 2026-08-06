@@ -1,0 +1,8 @@
+# 2018.1.00397.S / 2019.1.00036.S -- Already Published
+
+This dataset's publication/novelty check determined it has already been used in a peer-reviewed publication, so no new thesis-project plan was generated. See the citation below.
+
+VERDICT: PUBLISHED
+JUSTIFICATION: The project description explicitly self-cites a specific publication (Nguyen et al. 2026, ApJ, DOI 10.3847/1538-4357/ae771c) reporting a billion-solar-mass black hole in NGC 4061 from ALMA 12CO(2-1) kinematics, and this is directly corroborated by search result #1, "Dynamical Evidence for a Billion Solar-mass Black Hole in Galaxy NGC 4061 from ALMA 12CO(2–1) Kinematics" (2026, Dieu D. Nguyen et al.), which matches the target, method, wavelength, PI, and even describes combining archival Cycle 6 data with new Cycle 7 observations — consistent with the two combined project codes (2018.1.00397.S and 2019.1.00036.S) in the description.
+CITATIONS:
+1. "Dynamical Evidence for a Billion Solar-mass Black Hole in Galaxy NGC 4061 from ALMA 12CO(2–1) Kinematics" (2026) -- Dieu D. Nguyen et al. -- https://www.semanticscholar.org/paper/fe35dfd36bb99ea7c9464389e8dfb90c1726a00a

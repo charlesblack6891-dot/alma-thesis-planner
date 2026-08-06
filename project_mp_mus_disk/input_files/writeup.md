@@ -1,0 +1,9 @@
+# 2021.1.01205.S / 2017.1.01419.S / 2017.1.01167.S -- Already Published
+
+This dataset's publication/novelty check determined it has already been used in a peer-reviewed publication, so no new thesis-project plan was generated. See the citation below.
+
+VERDICT: PUBLISHED
+JUSTIFICATION: Search result 1, "Confirmation of a ring structure in the disk around MP Mus (PDS 66) with ALMA Band 7 observations" (Aguayo, Cáceres, et al. 2025), matches the project description exactly — same PI (Cáceres), same target, same combination of new Band 7 (0.89 mm) with archival Band 6 data, and the same key result (a previously-undetected ~80-85 au scattered-light ring not seen in Band 6, with a new ring reported via the Band 7 continuum). This is the Aguayo et al. 2025 A&A paper cited directly in the project description.
+CITATIONS:
+1. "Confirmation of a ring structure in the disk around MP Mus (PDS 66) with ALMA Band 7 observations" — A. Aguayo, Claudio Cáceres, Zhen Guo, M. R. Schreiber, Á. Ribas, J. Kastner, L. Cieza, S. Pérez, H. Cánovas, et al. (2025) — https://www.semanticscholar.org/paper/c54604d6cd4000b23e0cdb81e1c1745e3ac741a2
+2. "The ALMA view of MP Mus (PDS 66): A protoplanetary disk with no visible gaps down to 4 au scales" — Á. Ribas, E. Macías, P. Weber, S. Pérez, N. Cuello, R. Dong, A. Aguayo, C. Cáceres, et al. (2023) — https://www.semanticscholar.org/paper/649a316f8d456245c49b7fd2667a89c434ad2818 (related but earlier/independent dataset, not this project)

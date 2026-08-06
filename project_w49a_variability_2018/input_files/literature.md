@@ -1,0 +1,4 @@
+VERDICT: PUBLISHED
+JUSTIFICATION: No Semantic Scholar results were returned, but the project description itself identifies the source paper with full bibliographic detail (De Pree et al. 2018, ApJ Letters, arXiv:1807.10669), whose abstract matches this project's exact data (VLA 3.6 cm, B-configuration, 1994/2015 epochs, W49A UC/HC HII region field, G2 flux variation) and author list (De Pree, Wilner, Mac Low, Klessen among others). This is a confirmed match on project code/instrument/science goal/authorship, not merely a shared target.
+CITATIONS:
+1. De Pree, C. G.; Galvan-Madrid, R.; Goss, W. M.; Klessen, R. S.; Mac Low, M.-M.; Peters, T.; Wilner, D.; Bates, J.; Melo, T.; Presler-Marshall, B.; Webb-Forgus, R. (2018), "Flux Density Variations at 3.6 cm in the Massive Star-Forming Region W49A," ApJ Letters, arXiv:1807.10669
