@@ -12,3 +12,4 @@ alma_ca_bundle.pem
 # ALMA archive metadata export and ad-hoc run logs (regenerable scratch).
 /columns
 run_auto_output*.log
+~$*
