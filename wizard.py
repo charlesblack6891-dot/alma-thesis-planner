@@ -38,10 +38,10 @@ from alma_download import fetch_science_products
 from analysis import run_analysis
 from beginner_plan import generate_beginner_plan
 from blocks import extract_block
-from idea_loop import run_idea_loop, score_tractability
+from idea_loop import IdeaLoopResult, run_idea_loop, score_tractability
 from latex_paper import build_aastex_document, build_plain_document, compile_pdf
-from literature import check_published
-from llm import ClaudeCLIError, call_chatgpt, call_claude
+from literature import LiteratureResult, check_published, parse_verdict
+from llm import ClaudeCLIError, GeminiAPIError, PAID_GEMINI_MODEL, call_claude, call_gemini
 from methods import generate_methods
 from paper import assemble_paper_with_results
 from pipeline import run_pipeline
@@ -52,7 +52,9 @@ from state import (
     LITERATURE_FILE,
     METHODS_FILE,
     figures_dir,
+    input_files_dir,
     raw_data_dir,
+    read_state_file,
     write_state_file,
 )
 from topic_lookup import (
@@ -80,6 +82,16 @@ SCOPES: list[tuple[str, str, str]] = [
      "least vetted -- treat it as a rough starting point, not a settled plan."),
     ("idea_methods", "Idea + Methods only",
      "Literature check, idea loop, and methods plan. Fast, no data download."),
+    ("idea_only", "Idea only (split run, part 1)",
+     "Literature check and idea loop only -- renders idea.pdf and saves the idea for later. "
+     "Exactly the same API calls as the idea half of 'Idea + Methods', no extra cost. Useful "
+     "on Gemini's free tier (small daily request cap): run this today, then 'Methods only' "
+     "tomorrow to finish without re-spending any idea-loop calls."),
+    ("methods_only", "Methods only (split run, part 2)",
+     "Continues from a saved idea: reads idea.md from this data source's project folder (from "
+     "an earlier 'Idea only' run, an interrupted run, or a previous full run) and spends ONLY "
+     "the methods call(s) -- no literature or idea-loop calls are repeated. Renders methods.pdf. "
+     "Fails with a clear message if no saved idea exists yet."),
     ("full_paper", "Full paper",
      "All of the above, plus a real ALMA data download, real analysis, and a compiled paper PDF. "
      "Slower; only works for HCN(1-0) line-cube datasets."),
@@ -101,13 +113,45 @@ PUBLICATION_FILTERS: list[tuple[str, str, str]] = [
 
 # (provider key, display label, description)
 PROVIDERS: list[tuple[str, str, str]] = [
-    ("claude", "Claude", "Uses your Claude subscription via the `claude` CLI."),
-    ("chatgpt", "ChatGPT (fallback, free tier)",
-     "Use this if your Claude usage/tokens are exhausted. The free version of ChatGPT is less "
-     "capable and less consistent at following this pipeline's prompts than Claude, so treat "
-     "anything it produces as a rougher, less reliable draft. Only supports the 'Quick Summary' "
-     "and 'Idea + Methods' scopes -- 'Full paper' always requires Claude. Not implemented yet: "
-     "selecting this currently raises an error instead of making a real call."),
+    ("claude", "Claude -- requires tokens",
+     "Uses your Claude subscription (or API billing) via the `claude` CLI. Costs money -- either a "
+     "Claude Pro/Max/Team subscription or pay-per-token API credits -- but is the more capable, more "
+     "consistent writer for this pipeline's prompts, especially for 'Full paper' scope."),
+    ("gemini", "Gemini -- free",
+     "Uses Google's Gemini API with a free API key (get one, no billing/card required, at "
+     "https://aistudio.google.com/apikey -- set it as the GEMINI_API_KEY environment variable "
+     "before running). Costs nothing as long as you stay under Gemini's free-tier rate limits "
+     "(requests per minute/day, not a token budget), but is generally less capable and less "
+     "consistent at following this pipeline's multi-stage prompts than Claude -- treat its output "
+     "as a rougher draft. Only supports the 'Quick Summary' and 'Idea + Methods' scopes -- 'Full "
+     "paper' always requires Claude."),
+]
+
+# (tier key, display label, description) -- Gemini provider only. The tier
+# picks the Gemini model and sets cost expectations. IMPORTANT: whether a call
+# is actually free is decided by Google from the KEY's project, not by this
+# choice -- if the project behind the key has billing enabled (e.g. a spending
+# cap was set up at ai.studio/spend), Google charges every call per token, even
+# on the cheap flash model with "free" selected here. Confirmed live 2026-08-06:
+# a billing-enabled key selected as "free tier" still accrued ~$0.08.
+GEMINI_TIERS: list[tuple[str, str, str]] = [
+    ("free", "Free tier -- latest Flash model ($0 ONLY with a no-billing key)",
+     "Uses Google's rolling 'gemini-flash-latest' alias (the current cheap Flash model, whatever "
+     "Google ships this month -- pinned model ids get retired out from under new keys). $0 only "
+     "if the Google project behind your API key has NO "
+     "billing account attached -- Google decides this from the key itself, not from this "
+     "setting. If you've enabled billing or set a spending cap at ai.studio/spend, every call "
+     "is charged per token regardless of what's selected here; for a genuinely free key, go to "
+     "aistudio.google.com/apikey and create a key in a NEW project with no billing attached. "
+     "A no-billing key is capped in requests per minute and per day: the per-minute cap is "
+     "waited out and retried automatically (a slower call, not an error); the DAILY cap stops "
+     "the run with a clear message and only resets at midnight US Pacific time."),
+    ("paid", "Paid tier -- latest Pro model (billing required, pay-per-token)",
+     "Uses Google's rolling 'gemini-pro-latest' alias (the current strongest Pro model). "
+     "Requires billing enabled on the Google Cloud account behind your key -- every call CHARGES "
+     "that account per token, at a higher rate than Flash. In exchange: a stronger model and "
+     "much higher rate limits. If your key has no billing attached, calls on this tier will "
+     "fail with a quota error -- pick the free tier instead."),
 ]
 
 HCN10_REST_FREQ_HZ = 88.631601e9
@@ -185,27 +229,52 @@ def _make_call_claude(model: str | None, progress: Callable[[str], None]) -> Cal
     return _cc
 
 
-def _make_call_chatgpt(progress: Callable[[str], None]) -> Callable[[str], str]:
+def _make_call_gemini(progress: Callable[[str], None], model: str | None = None) -> Callable[[str], str]:
     """Same per-call progress logging as _make_call_claude, above, wrapping
-    llm.call_chatgpt instead. That function isn't implemented yet (see its own
-    docstring), so every call made through this wrapper raises -- this exists so the
-    provider selection has a real seam to plumb through the rest of the wizard now,
-    ready for a real ChatGPT integration to drop in later without touching callers."""
+    llm.call_gemini instead. A single retry on GeminiAPIError mirrors
+    _make_call_claude's retry -- cheap insurance against a transient failure or a
+    momentary free-tier rate-limit blip discarding an otherwise-fine run.
+    `model` picks the Gemini model (free tier -> default flash, paid tier ->
+    pro); per-minute 429 waits happen inside call_gemini itself."""
     call_count = 0
 
     def _cc(prompt: str) -> str:
         nonlocal call_count
         call_count += 1
-        progress(f"  [chatgpt call {call_count}] sending ({len(prompt)} chars)...")
-        return call_chatgpt(prompt)
+        n = call_count
+        for attempt in range(1, CLAUDE_CALL_MAX_ATTEMPTS + 1):
+            suffix = f", attempt {attempt}/{CLAUDE_CALL_MAX_ATTEMPTS}" if attempt > 1 else ""
+            progress(f"  [gemini call {n}] sending ({len(prompt)} chars, model={model or 'default'}{suffix})...")
+            start = time.monotonic()
+            try:
+                result = call_gemini(prompt, timeout=CLAUDE_CALL_TIMEOUT_S, model=model)
+            except GeminiAPIError as exc:
+                elapsed = time.monotonic() - start
+                if attempt < CLAUDE_CALL_MAX_ATTEMPTS:
+                    progress(f"  [gemini call {n}] failed after {elapsed:.0f}s ({exc}) -- retrying")
+                    continue
+                progress(f"  [gemini call {n}] FAILED after {elapsed:.0f}s")
+                raise
+            progress(f"  [gemini call {n}] done in {time.monotonic() - start:.0f}s")
+            return result
+        raise AssertionError("unreachable")  # loop always returns or raises
 
     return _cc
 
 
-def _make_call_llm(provider: str, model: str | None, progress: Callable[[str], None]) -> Callable[[str], str]:
-    """Pick the right per-call wrapper for cfg.provider ("claude" or "chatgpt")."""
-    if provider == "chatgpt":
-        return _make_call_chatgpt(progress)
+def _make_call_llm(
+    provider: str,
+    model: str | None,
+    progress: Callable[[str], None],
+    *,
+    gemini_tier: str = "free",
+) -> Callable[[str], str]:
+    """Pick the right per-call wrapper for cfg.provider ("claude" or "gemini").
+    `model` is the Claude model id (ignored for Gemini); `gemini_tier` ("free"
+    or "paid") picks the Gemini model instead."""
+    if provider == "gemini":
+        gemini_model = PAID_GEMINI_MODEL if gemini_tier == "paid" else None
+        return _make_call_gemini(progress, gemini_model)
     return _make_call_claude(model, progress)
 
 
@@ -450,9 +519,10 @@ def _cube_rest_freq_hz(cube_fits: Path) -> float:
 @dataclass
 class WizardConfig:
     mode: str  # "manual" or "search"
-    scope: str  # "quick_summary", "idea_methods", or "full_paper"
+    scope: str  # one of SCOPES[i][0]
     model: str  # one of MODELS[i][0], or "" for the claude CLI's own default
     provider: str = "claude"  # one of PROVIDERS[i][0]
+    gemini_tier: str = "free"  # one of GEMINI_TIERS[i][0]; only read when provider == "gemini"
     prompt_text: str = ""  # search-mode topic; optional if category+keyword are given; kept for the record in manual mode too
     category: str = ""  # search-mode scientific category (required together with keyword)
     keyword: str = ""  # search-mode science keyword (required together with category)
@@ -470,7 +540,7 @@ class WizardConfig:
 
 @dataclass
 class WizardResult:
-    status: str  # "short_circuited" or "done"
+    status: str  # "short_circuited", "done", or "partial" (API quota/failure interrupted the run; completed stages saved)
     project_dir: str
     resolved: ResolvedSource
     literature_verdict: str
@@ -504,6 +574,116 @@ def _checkpoint_stage(project_dir: str, stage: str, content: str, progress: Call
     progress(f"  (checkpointed {_STAGE_FILES[stage]})")
 
 
+# Present in input_files/ while a run is underway; removed on success. Its
+# survival marks an interrupted run, which is what authorizes the next run on
+# the same project to reuse checkpointed stages instead of re-spending API
+# calls on them. Deliberately NOT keyed on checkpoint files alone: a completed
+# run leaves the same idea.md/methods.md behind, and re-running a completed
+# project should regenerate fresh output (the old behavior), not silently
+# replay the previous run's files.
+_INCOMPLETE_MARKER = "run_incomplete.marker"
+
+
+def _mark_run_incomplete(project_dir: str) -> None:
+    path = input_files_dir(project_dir) / _INCOMPLETE_MARKER
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "This run has not completed. While this file exists, the next run on this project "
+        "reuses the checkpointed stage files below it instead of re-spending API calls.\n",
+        encoding="utf-8",
+    )
+
+
+def _clear_incomplete_marker(project_dir: str) -> None:
+    (input_files_dir(project_dir) / _INCOMPLETE_MARKER).unlink(missing_ok=True)
+
+
+def _load_resumable_stages(project_dir: str) -> dict[str, str]:
+    """If the previous run on this project was interrupted (marker present),
+    return {stage: checkpointed content} for every stage it completed.
+    Empty dict otherwise -- costs no API calls either way."""
+    if not (input_files_dir(project_dir) / _INCOMPLETE_MARKER).exists():
+        return {}
+    stages = {}
+    for stage, filename in _STAGE_FILES.items():
+        try:
+            content = read_state_file(project_dir, filename).strip()
+        except FileNotFoundError:
+            continue
+        if content:
+            stages[stage] = content
+    return stages
+
+
+def _render_plain_pdf(project_dir: str, title: str, body: str, basename: str,
+                      progress: Callable[[str], None]) -> str:
+    """Markdown -> local LaTeX -> <project_dir>/<basename>.pdf. No API calls."""
+    tex = build_plain_document(title, body)
+    built = compile_pdf(tex, Path(project_dir) / "pdf_build", basename=basename)
+    out = Path(project_dir) / f"{basename}.pdf"
+    out.write_bytes(built.read_bytes())
+    progress(f"Wrote {out}")
+    return str(out)
+
+
+def _salvage_partial(project_dir: str, resolved: ResolvedSource, exc: Exception,
+                     progress: Callable[[str], None]) -> WizardResult:
+    """An API call failed mid-run (quota exhausted, CLI failure). Instead of
+    discarding the run: render PDFs locally (zero API calls) from every stage
+    the checkpoints show as completed, leave the incomplete-marker in place,
+    and tell the user the next run on this data source resumes for free."""
+    progress(f"API failure interrupted the run: {exc}")
+    progress("Saving completed stages -- no further API calls are made for this.")
+
+    # _ensure_output_paths_writable's probe leaves 0-byte PDFs for outputs the
+    # run never reached -- delete them so the folder only holds real files
+    # (an empty methods.pdf reads as a corrupt PDF, not an absent one).
+    for name in ("summary.pdf", "idea.pdf", "methods.pdf", "paper.pdf", "beginner_plan.pdf"):
+        probe = Path(project_dir) / name
+        try:
+            if probe.exists() and probe.stat().st_size == 0:
+                probe.unlink()
+        except OSError:
+            pass
+
+    pdfs: list[str] = []
+    saved: list[str] = []
+    verdict = "UNKNOWN"
+    for stage, filename in _STAGE_FILES.items():
+        try:
+            content = read_state_file(project_dir, filename).strip()
+        except FileNotFoundError:
+            continue
+        if not content:
+            continue
+        saved.append(filename)
+        try:
+            if stage == "literature":
+                verdict = parse_verdict(content)
+            elif stage == "idea":
+                pdfs.append(_render_plain_pdf(
+                    project_dir, f"Research Idea: {resolved.target}", content, "idea", progress))
+            elif stage == "methods":
+                pdfs.append(_render_plain_pdf(
+                    project_dir, f"Methods: {resolved.target}", content, "methods", progress))
+        except Exception as render_exc:  # noqa: BLE001 -- salvage must not mask the original failure
+            progress(f"  (could not render {filename} to PDF: {render_exc} -- the .md file is still saved)")
+
+    notes = [
+        f"The run was interrupted by an API failure: {exc}",
+        "Completed stages saved: " + (", ".join(saved) if saved else "(none)"),
+        "Re-run the SAME data source (same project code/target) once API access is back -- "
+        "e.g. after the Gemini free-tier daily reset at midnight US Pacific -- and the saved "
+        "stages above will be reused automatically, spending API calls only on what's missing.",
+    ]
+    for note in notes:
+        progress(note)
+    return WizardResult(
+        status="partial", project_dir=project_dir, resolved=resolved,
+        literature_verdict=verdict, pdfs=pdfs, notes=notes,
+    )
+
+
 def generate(
     cfg: WizardConfig,
     resolved: ResolvedSource,
@@ -513,13 +693,13 @@ def generate(
     """The expensive step: literature check, idea/methods loop, PDF
     rendering, and (for full_paper scope) real ALMA download + analysis +
     compiled paper PDF."""
-    if cfg.provider == "chatgpt" and cfg.scope == "full_paper":
+    if cfg.provider == "gemini" and cfg.scope == "full_paper":
         raise ValueError(
-            "The ChatGPT provider only supports the 'Quick Summary' and 'Idea + Methods' scopes -- "
+            "The Gemini provider only supports the 'Quick Summary' and 'Idea + Methods' scopes -- "
             "'Full paper' needs Claude for the real-data analysis writeup. Switch the provider back "
             "to Claude, or pick a different scope."
         )
-    cc = _make_call_llm(cfg.provider, cfg.model or None, progress)
+    cc = _make_call_llm(cfg.provider, cfg.model or None, progress, gemini_tier=cfg.gemini_tier)
 
     project_dir = cfg.project_dir.strip() or (
         f"project_{slugify(resolved.project_code)}_{slugify(resolved.target)}"
@@ -532,6 +712,10 @@ def generate(
     # _ensure_output_paths_writable's docstring for why this matters.
     if cfg.scope == "quick_summary":
         output_paths = [Path(project_dir) / "summary.pdf"]
+    elif cfg.scope == "idea_only":
+        output_paths = [Path(project_dir) / "idea.pdf"]
+    elif cfg.scope == "methods_only":
+        output_paths = [Path(project_dir) / "methods.pdf"]
     else:
         output_paths = [Path(project_dir) / "idea.pdf", Path(project_dir) / "methods.pdf"]
         if cfg.scope == "full_paper":
@@ -543,6 +727,52 @@ def generate(
     progress(f"Project directory: {project_dir}")
     progress(f"Data source: {resolved.project_code} / PI {resolved.pi} / target {resolved.target}")
     progress(resolved.source_note)
+
+    # --- scope == "methods_only": continue from a saved idea ----------------
+    # Spends ONLY the methods call (plus the optional beginner plan) -- the
+    # literature check and idea loop are read back from the project folder,
+    # so a split "Idea only" today + "Methods only" tomorrow costs exactly
+    # the same total API calls as one combined "Idea + Methods" run.
+    if cfg.scope == "methods_only":
+        try:
+            idea_text = read_state_file(project_dir, IDEA_FILE).strip()
+        except FileNotFoundError:
+            raise ValueError(
+                "No saved idea found for this data source (looked for "
+                f"{input_files_dir(project_dir) / IDEA_FILE}). Run 'Idea only' (or a full "
+                "'Idea + Methods') for the same project code/target first -- 'Methods only' "
+                "continues from that saved idea."
+            )
+        try:
+            verdict = parse_verdict(read_state_file(project_dir, LITERATURE_FILE).strip())
+        except FileNotFoundError:
+            verdict = "UNKNOWN"
+        progress("Reusing the saved idea (idea.md) -- spending only the methods call...")
+        _mark_run_incomplete(project_dir)
+        try:
+            methods_text = generate_methods(resolved.data_description, idea_text, call_claude_fn=cc)
+        except (GeminiAPIError, ClaudeCLIError) as exc:
+            return _salvage_partial(project_dir, resolved, exc, progress)
+        write_state_file(project_dir, METHODS_FILE, methods_text + "\n")
+        pdfs = [_render_plain_pdf(project_dir, f"Methods: {resolved.target}", methods_text,
+                                  "methods", progress)]
+        if cfg.beginner_plan:
+            progress("Writing a beginner-friendly plan (goal, skills needed, first week walkthrough)...")
+            try:
+                beginner_text = generate_beginner_plan(
+                    resolved.data_description, idea_text, methods_text, resolved.target,
+                    call_claude_fn=cc,
+                )
+            except (GeminiAPIError, ClaudeCLIError) as exc:
+                return _salvage_partial(project_dir, resolved, exc, progress)
+            write_state_file(project_dir, BEGINNER_PLAN_FILE, beginner_text + "\n")
+            pdfs.append(_render_plain_pdf(project_dir, f"Beginner's Guide: {resolved.target}",
+                                          beginner_text, "beginner_plan", progress))
+        _clear_incomplete_marker(project_dir)
+        return WizardResult(
+            status="done", project_dir=project_dir, resolved=resolved,
+            literature_verdict=verdict, pdfs=pdfs,
+        )
 
     # quick_summary trades thoroughness for speed: one maker/critic pass instead of
     # cfg.n_iterations (the default 4 means 8 idea-loop calls alone), and the
@@ -558,22 +788,57 @@ def generate(
         score_tractability_fn = partial(score_tractability, call_claude_fn=cc)
         progress("Checking publication status, then running the idea + methods loop (this makes several Claude calls)...")
 
-    result = run_pipeline(
-        resolved.project_code, resolved.pi, resolved.target, resolved.data_description,
-        n_iterations=n_iterations,
-        check_published_fn=partial(check_published, call_claude_fn=cc),
-        run_idea_loop_fn=partial(run_idea_loop, call_claude_fn=cc),
-        score_tractability_fn=score_tractability_fn,
-        generate_methods_fn=partial(generate_methods, call_claude_fn=cc),
-        assemble_writeup_fn=partial(assemble_writeup, call_claude_fn=cc),
-        # Neither idea_methods nor full_paper scope ever reads result.writeup
-        # below -- only .idea/.methods -- so the writeup call (the single
-        # largest prompt in the chain, folding idea+methods+literature
-        # together) is pure wasted cost/risk here. Skipped entirely rather
-        # than just retried/checkpointed around.
-        include_writeup=False,
-        on_stage_complete=lambda stage, content: _checkpoint_stage(project_dir, stage, content, progress),
-    )
+    # If the previous run on this project was interrupted (quota exhausted,
+    # CLI failure), reuse every stage it already paid for -- zero API calls
+    # for those stages. Gated on the incomplete-marker so re-running a
+    # *completed* project still regenerates fresh output as before.
+    check_published_fn = partial(check_published, call_claude_fn=cc)
+    run_idea_loop_fn = partial(run_idea_loop, call_claude_fn=cc)
+    generate_methods_fn = partial(generate_methods, call_claude_fn=cc)
+    resume = _load_resumable_stages(project_dir)
+    if resume:
+        progress(
+            "Resuming the interrupted run: reusing "
+            + ", ".join(_STAGE_FILES[s] for s in sorted(resume))
+            + " -- no API calls are spent on these stages."
+        )
+        if "literature" in resume:
+            lit_raw = resume["literature"]
+            check_published_fn = lambda *a, **k: LiteratureResult(verdict=parse_verdict(lit_raw), raw=lit_raw)
+        if "idea" in resume:
+            idea_raw = resume["idea"]
+            run_idea_loop_fn = lambda *a, **k: IdeaLoopResult(final_idea=idea_raw, iterations=[])
+            # The tractability score belongs to the idea stage (its output is
+            # never read by any wizard scope) -- don't re-spend its call on a
+            # resumed idea.
+            score_tractability_fn = lambda *a, **k: ""
+        if "methods" in resume:
+            methods_raw = resume["methods"]
+            generate_methods_fn = lambda *a, **k: methods_raw
+
+    _mark_run_incomplete(project_dir)
+    try:
+        result = run_pipeline(
+            resolved.project_code, resolved.pi, resolved.target, resolved.data_description,
+            n_iterations=n_iterations,
+            check_published_fn=check_published_fn,
+            run_idea_loop_fn=run_idea_loop_fn,
+            score_tractability_fn=score_tractability_fn,
+            generate_methods_fn=generate_methods_fn,
+            assemble_writeup_fn=partial(assemble_writeup, call_claude_fn=cc),
+            # Neither idea_methods nor full_paper scope ever reads result.writeup
+            # below -- only .idea/.methods -- so the writeup call (the single
+            # largest prompt in the chain, folding idea+methods+literature
+            # together) is pure wasted cost/risk here. Skipped entirely rather
+            # than just retried/checkpointed around.
+            include_writeup=False,
+            # "Idea only" stops before the methods call so its cost can be
+            # spent on a later "Methods only" run instead.
+            include_methods=(cfg.scope != "idea_only"),
+            on_stage_complete=lambda stage, content: _checkpoint_stage(project_dir, stage, content, progress),
+        )
+    except (GeminiAPIError, ClaudeCLIError) as exc:
+        return _salvage_partial(project_dir, resolved, exc, progress)
     progress(f"Publication verdict: {result.literature.verdict}")
 
     if result.short_circuited:
@@ -581,6 +846,7 @@ def generate(
             "This dataset is already published (or its status is unclear) -- stopping here, no "
             "idea/methods/paper PDFs were generated. See literature.md in the project folder."
         )
+        _clear_incomplete_marker(project_dir)
         return WizardResult(
             status="short_circuited",
             project_dir=project_dir,
@@ -590,57 +856,68 @@ def generate(
         )
 
     write_state_file(project_dir, IDEA_FILE, result.idea + "\n")
-    write_state_file(project_dir, METHODS_FILE, result.methods + "\n")
-    progress("Idea and methods settled. Rendering PDFs...")
+    if result.methods is not None:
+        write_state_file(project_dir, METHODS_FILE, result.methods + "\n")
+        progress("Idea and methods settled. Rendering PDFs...")
+    else:
+        progress("Idea settled. Rendering PDF...")
 
     pdf_build_dir = Path(project_dir) / "pdf_build"
     pdfs: list[str] = []
 
     if cfg.beginner_plan:
-        # Runs regardless of scope -- the idea/methods text above is settled
-        # by this point for quick_summary, idea_methods, and full_paper
-        # alike, and this companion document just re-explains the same
-        # project in plain language rather than depending on anything
-        # scope-specific (e.g. full_paper's real-data results).
-        progress("Writing a beginner-friendly plan (goal, skills needed, first week walkthrough)...")
-        beginner_text = generate_beginner_plan(
-            resolved.data_description, result.idea, result.methods, resolved.target, call_claude_fn=cc,
-        )
-        write_state_file(project_dir, BEGINNER_PLAN_FILE, beginner_text + "\n")
-        beginner_tex = build_plain_document(f"Beginner's Guide: {resolved.target}", beginner_text)
-        beginner_pdf = compile_pdf(beginner_tex, pdf_build_dir, basename="beginner_plan")
-        beginner_out = Path(project_dir) / "beginner_plan.pdf"
-        beginner_out.write_bytes(beginner_pdf.read_bytes())
-        pdfs.append(str(beginner_out))
-        progress(f"Wrote {beginner_out}")
+        # Runs on every scope that has methods text settled by this point
+        # (quick_summary, idea_methods, full_paper) -- this companion
+        # document just re-explains the same project in plain language.
+        # "Idea only" has no methods yet, so it defers to the later
+        # "Methods only" run rather than generating a plan with a hole in it.
+        if result.methods is None:
+            progress(
+                "Beginner-friendly plan deferred -- it needs the methods stage; tick the "
+                "checkbox again on the 'Methods only' run to generate it then."
+            )
+        else:
+            progress("Writing a beginner-friendly plan (goal, skills needed, first week walkthrough)...")
+            try:
+                beginner_text = generate_beginner_plan(
+                    resolved.data_description, result.idea, result.methods, resolved.target,
+                    call_claude_fn=cc,
+                )
+            except (GeminiAPIError, ClaudeCLIError) as exc:
+                return _salvage_partial(project_dir, resolved, exc, progress)
+            write_state_file(project_dir, BEGINNER_PLAN_FILE, beginner_text + "\n")
+            pdfs.append(_render_plain_pdf(project_dir, f"Beginner's Guide: {resolved.target}",
+                                          beginner_text, "beginner_plan", progress))
 
     if cfg.scope == "quick_summary":
         summary_body = f"## Idea\n\n{result.idea}\n\n## Methods\n\n{result.methods}\n"
-        summary_tex = build_plain_document(f"Summary Plan: {resolved.target}", summary_body)
-        summary_pdf = compile_pdf(summary_tex, pdf_build_dir, basename="summary")
-        summary_out = Path(project_dir) / "summary.pdf"
-        summary_out.write_bytes(summary_pdf.read_bytes())
-        pdfs.append(str(summary_out))
-        progress(f"Wrote {summary_out}")
+        pdfs.append(_render_plain_pdf(project_dir, f"Summary Plan: {resolved.target}",
+                                      summary_body, "summary", progress))
+        _clear_incomplete_marker(project_dir)
         return WizardResult(
             status="done", project_dir=project_dir, resolved=resolved,
             literature_verdict=result.literature.verdict, pdfs=pdfs,
         )
 
-    idea_tex = build_plain_document(f"Research Idea: {resolved.target}", result.idea)
-    idea_pdf = compile_pdf(idea_tex, pdf_build_dir, basename="idea")
-    idea_out = Path(project_dir) / "idea.pdf"
-    idea_out.write_bytes(idea_pdf.read_bytes())
-    pdfs.append(str(idea_out))
+    pdfs.append(_render_plain_pdf(project_dir, f"Research Idea: {resolved.target}",
+                                  result.idea, "idea", progress))
 
-    methods_tex = build_plain_document(f"Methods: {resolved.target}", result.methods)
-    methods_pdf = compile_pdf(methods_tex, pdf_build_dir, basename="methods")
-    methods_out = Path(project_dir) / "methods.pdf"
-    methods_out.write_bytes(methods_pdf.read_bytes())
-    pdfs.append(str(methods_out))
-    progress(f"Wrote {idea_out} and {methods_out}")
+    if cfg.scope == "idea_only":
+        progress(
+            "Idea saved. Run 'Methods only' on this same data source (today or any later day) "
+            "to finish -- it reuses this idea and spends only the methods call."
+        )
+        _clear_incomplete_marker(project_dir)
+        return WizardResult(
+            status="done", project_dir=project_dir, resolved=resolved,
+            literature_verdict=result.literature.verdict, pdfs=pdfs,
+        )
+
+    pdfs.append(_render_plain_pdf(project_dir, f"Methods: {resolved.target}",
+                                  result.methods, "methods", progress))
 
     if cfg.scope == "idea_methods":
+        _clear_incomplete_marker(project_dir)
         return WizardResult(
             status="done", project_dir=project_dir, resolved=resolved,
             literature_verdict=result.literature.verdict, pdfs=pdfs,
@@ -652,7 +929,10 @@ def generate(
     distance_source_note = "User-provided value."
     if distance_mpc is None or systemic_velocity_kms is None:
         progress("Looking up this target's distance and systemic velocity...")
-        dv = lookup_distance_velocity(resolved.target, resolved.data_description, call_claude_fn=cc)
+        try:
+            dv = lookup_distance_velocity(resolved.target, resolved.data_description, call_claude_fn=cc)
+        except (GeminiAPIError, ClaudeCLIError) as exc:
+            return _salvage_partial(project_dir, resolved, exc, progress)
         distance_mpc, systemic_velocity_kms = dv.distance_mpc, dv.systemic_velocity_kms
         distance_source_note = dv.source_note
         progress(f"Adopted distance={distance_mpc} Mpc, systemic velocity={systemic_velocity_kms} km/s ({distance_source_note})")
@@ -727,7 +1007,10 @@ def generate(
     progress(f"HCN central-depression interpretation: {results['hcn']['central_depression_interpretation']}")
 
     progress("Writing real-results paper sections (several more Claude calls)...")
-    sections = assemble_paper_with_results(result.idea, result.methods, result.literature.raw, results, call_claude_fn=cc)
+    try:
+        sections = assemble_paper_with_results(result.idea, result.methods, result.literature.raw, results, call_claude_fn=cc)
+    except (GeminiAPIError, ClaudeCLIError) as exc:
+        return _salvage_partial(project_dir, resolved, exc, progress)
 
     progress("Assembling AASTeX document and compiling the paper PDF...")
     figs_dir = figures_dir(project_dir)
@@ -771,6 +1054,7 @@ def generate(
     pdfs.append(str(final_pdf))
     progress(f"Wrote {final_pdf}")
 
+    _clear_incomplete_marker(project_dir)
     return WizardResult(
         status="done", project_dir=project_dir, resolved=resolved,
         literature_verdict=result.literature.verdict, pdfs=pdfs,
