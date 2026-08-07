@@ -2,8 +2,15 @@
 
 Two providers, both exposed as plain prompt-in/text-out functions:
 - call_claude: shells out to a headless `claude -p` invocation. Zero API
-  keys required, but needs a paid Claude subscription or API billing behind
-  the CLI login -- see llm.py's own README note in wizard.py's PROVIDERS.
+  keys required -- it uses whatever account the `claude` CLI is already
+  logged into (`claude` -> "Claude account" login, chosen once outside this
+  app). Anthropic documents Claude Code CLI access as requiring a paid
+  Claude Pro/Max/Team/Enterprise plan or API billing; a free claude.ai
+  account may or may not be granted CLI access, and if not, every call
+  fails immediately with an auth/permission error from the CLI. See
+  wizard.py's PROVIDERS ("claude" vs. "claude_free") for the user-facing
+  explanation -- the Python code path is identical either way, since
+  call_claude has no way to tell which account is logged in.
 - call_gemini: calls Google's Gemini API directly over HTTPS. Needs a
   GEMINI_API_KEY (free, no billing/card required, from
   https://aistudio.google.com/apikey), and stays within Gemini's free tier

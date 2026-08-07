@@ -117,6 +117,17 @@ PROVIDERS: list[tuple[str, str, str]] = [
      "Uses your Claude subscription (or API billing) via the `claude` CLI. Costs money -- either a "
      "Claude Pro/Max/Team subscription or pay-per-token API credits -- but is the more capable, more "
      "consistent writer for this pipeline's prompts, especially for 'Full paper' scope."),
+    ("claude_free", "Claude -- free account",
+     "Uses the SAME `claude` CLI as the option above, but assumes you've logged into it with a free "
+     "claude.ai account instead of a paid plan or API key: run `claude` once outside this app and, "
+     "when it asks how to authenticate, choose 'Claude account' (not 'Anthropic Console API key'), "
+     "then log in with a free claude.ai account. This costs nothing, but Anthropic's Claude Code CLI "
+     "is documented as requiring a Pro/Max/Team/Enterprise plan (or API credits) -- a plain free "
+     "claude.ai account may be refused CLI access entirely, in which case every call here will fail "
+     "immediately with an authentication/permission error from the CLI. If that happens, either "
+     "upgrade the account or switch back to the 'requires tokens' option (paid) or Gemini (free "
+     "API). Free claude.ai accounts also have a low daily message cap, so a long run (e.g. 'Full "
+     "paper') can run out partway through even if login succeeds."),
     ("gemini", "Gemini -- free",
      "Uses Google's Gemini API with a free API key (get one, no billing/card required, at "
      "https://aistudio.google.com/apikey -- set it as the GEMINI_API_KEY environment variable "
@@ -269,9 +280,12 @@ def _make_call_llm(
     *,
     gemini_tier: str = "free",
 ) -> Callable[[str], str]:
-    """Pick the right per-call wrapper for cfg.provider ("claude" or "gemini").
-    `model` is the Claude model id (ignored for Gemini); `gemini_tier` ("free"
-    or "paid") picks the Gemini model instead."""
+    """Pick the right per-call wrapper for cfg.provider ("claude", "claude_free", or
+    "gemini"). "claude" and "claude_free" both go through the same `claude` CLI --
+    the only difference is which account you logged that CLI into (paid vs. free
+    claude.ai), which this code has no visibility into and can't enforce. `model`
+    is the Claude model id (ignored for Gemini); `gemini_tier` ("free" or "paid")
+    picks the Gemini model instead."""
     if provider == "gemini":
         gemini_model = PAID_GEMINI_MODEL if gemini_tier == "paid" else None
         return _make_call_gemini(progress, gemini_model)
@@ -521,7 +535,7 @@ class WizardConfig:
     mode: str  # "manual" or "search"
     scope: str  # one of SCOPES[i][0]
     model: str  # one of MODELS[i][0], or "" for the claude CLI's own default
-    provider: str = "claude"  # one of PROVIDERS[i][0]
+    provider: str = "claude"  # one of PROVIDERS[i][0] ("claude", "claude_free", or "gemini")
     gemini_tier: str = "free"  # one of GEMINI_TIERS[i][0]; only read when provider == "gemini"
     prompt_text: str = ""  # search-mode topic; optional if category+keyword are given; kept for the record in manual mode too
     category: str = ""  # search-mode scientific category (required together with keyword)
