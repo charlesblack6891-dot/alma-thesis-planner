@@ -1,6 +1,6 @@
 """LLM call primitives (Stage 1, extended).
 
-Two providers, both exposed as plain prompt-in/text-out functions:
+Three providers, all exposed as plain prompt-in/text-out functions:
 - call_claude: shells out to a headless `claude -p` invocation. Zero API
   keys required -- it uses whatever account the `claude` CLI is already
   logged into (`claude` -> "Claude account" login, chosen once outside this
@@ -15,6 +15,11 @@ Two providers, both exposed as plain prompt-in/text-out functions:
   GEMINI_API_KEY (free, no billing/card required, from
   https://aistudio.google.com/apikey), and stays within Gemini's free tier
   as long as request volume stays under its rate limits.
+- call_uva_genai: calls UVA Research Computing's GenAI service (an
+  Open WebUI front end over a self-hosted Kimi K2.5 deployment on Rivanna/
+  Afton) over HTTPS. Only reachable by users with UVA RC HPC access and an
+  API key issued through RC's GenAI portal; needs UVARC_GenAI_API set.
+  Free (no billing), capped at 60 requests/minute.
 """
 from __future__ import annotations
 
@@ -25,6 +30,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from typing import Callable
 
 import requests
 
@@ -48,6 +54,10 @@ class ClaudeCLIError(RuntimeError):
 
 class GeminiAPIError(RuntimeError):
     """Raised when the Gemini API call fails, is misconfigured, or returns no usable text."""
+
+
+class UVAGenAIError(RuntimeError):
+    """Raised when the UVA RC GenAI API call fails, is misconfigured, or returns no usable text."""
 
 
 # Headless `claude -p` keeps full agentic tool access by default (Read/Glob/Bash on
@@ -221,7 +231,13 @@ def _parse_retry_delay_s(response_json: dict) -> float:
     return _RATE_LIMIT_DEFAULT_WAIT_S
 
 
-def call_gemini(prompt: str, *, timeout: float = 120, model: str | None = None) -> str:
+def call_gemini(
+    prompt: str,
+    *,
+    timeout: float = 120,
+    model: str | None = None,
+    on_wait: Callable[[float], None] | None = None,
+) -> str:
     """Send `prompt` to Gemini via its HTTPS API and return the response text.
 
     Free-tier fallback for call_claude: needs a GEMINI_API_KEY (free, no billing
@@ -229,6 +245,12 @@ def call_gemini(prompt: str, *, timeout: float = 120, model: str | None = None) 
     subscription, but is generally a less capable/consistent writer for this
     pipeline's multi-stage prompts, and is rate-limited (requests per minute/day)
     rather than token-metered.
+
+    `on_wait(seconds)`, if given, is called immediately before each internal
+    503/429 backoff sleep -- lets a caller log "waiting Ns..." instead of the
+    call silently going quiet for up to _RATE_LIMIT_MAX_WAITS * up to 70s
+    (currently ~3.5 minutes worst case), which otherwise looks identical to a
+    genuine hang from the wizard's per-call progress log.
     """
     api_key = os.environ.get(GEMINI_API_KEY_ENV_VAR)
     if not api_key:
@@ -240,6 +262,20 @@ def call_gemini(prompt: str, *, timeout: float = 120, model: str | None = None) 
 
     resolved_model = model or os.environ.get(GEMINI_MODEL_ENV_VAR) or DEFAULT_GEMINI_MODEL
     url = _GEMINI_ENDPOINT.format(model=resolved_model)
+    request_body: dict = {"contents": [{"parts": [{"text": prompt}]}]}
+    # Gemini's Flash-family models (which the free tier's DEFAULT_GEMINI_MODEL
+    # resolves to) run extended "thinking" ON BY DEFAULT, and thinking tokens are
+    # billed/counted the same as output tokens against the same response budget
+    # (confirmed via ai.google.dev/gemini-api/docs/thinking, 2026-08). This
+    # pipeline only wants a single formatted text block per call -- it gets no
+    # benefit from hidden chain-of-thought, and every thinking token spent is
+    # pure overhead against the free tier's per-minute/per-day request caps and
+    # this call's own timeout. thinkingBudget=0 turns thinking off entirely.
+    # Pro-family models (PAID_GEMINI_MODEL) CANNOT disable thinking -- sending
+    # thinkingBudget=0 to gemini-2.5-pro (and later Pro models) is rejected --
+    # so this is gated to Flash-named models only; Pro calls are left untouched.
+    if "flash" in resolved_model.lower():
+        request_body["generationConfig"] = {"thinkingConfig": {"thinkingBudget": 0}}
     # Two transients are waited out here rather than surfaced, because one
     # mid-pipeline throw discards every already-made call in the run:
     # - 503 ("model is experiencing high demand") -- observed repeatedly in a
@@ -252,19 +288,40 @@ def call_gemini(prompt: str, *, timeout: float = 120, model: str | None = None) 
     response = None
     rate_limit_waits = 0
     attempt = 0
+    thinking_config_dropped = False
     while True:
         attempt += 1
         try:
             response = requests.post(
                 url,
                 params={"key": api_key},
-                json={"contents": [{"parts": [{"text": prompt}]}]},
+                json=request_body,
                 timeout=timeout,
             )
         except requests.RequestException as exc:
             raise GeminiAPIError(f"Gemini API request failed: {exc}") from exc
+        if (
+            response.status_code == 400
+            and "generationConfig" in request_body
+            and not thinking_config_dropped
+        ):
+            # Google rotates which model a "-latest" alias resolves to (see
+            # DEFAULT_GEMINI_MODEL's comment) without warning, and newer Flash
+            # generations have changed how thinking is disabled -- e.g. a model
+            # that no longer accepts thinkingBudget=0 at all and rejects the whole
+            # request with a bare "Request contains an invalid argument" 400,
+            # observed live 2026-08-10 against gemini-flash-latest. Rather than
+            # hard-failing the whole pipeline run over what is purely a
+            # token-saving optimization, drop the generationConfig override and
+            # retry once with the model's default (thinking-enabled) behavior.
+            thinking_config_dropped = True
+            del request_body["generationConfig"]
+            continue
         if response.status_code == 503 and attempt < 3:
-            time.sleep(5 * attempt)
+            delay = 5 * attempt
+            if on_wait:
+                on_wait(delay)
+            time.sleep(delay)
             continue
         if response.status_code == 429:
             body_squashed = response.text.upper().replace("_", "").replace(" ", "")
@@ -291,6 +348,8 @@ def call_gemini(prompt: str, *, timeout: float = 120, model: str | None = None) 
                     delay = _parse_retry_delay_s(response.json())
                 except json.JSONDecodeError:
                     delay = _RATE_LIMIT_DEFAULT_WAIT_S
+                if on_wait:
+                    on_wait(delay)
                 time.sleep(delay)
                 continue
             raise GeminiAPIError(
@@ -326,8 +385,139 @@ def call_gemini(prompt: str, *, timeout: float = 120, model: str | None = None) 
     text = "".join(part.get("text", "") for part in parts)
     if not text:
         finish_reason = candidates[0].get("finishReason")
+        if finish_reason == "MAX_TOKENS":
+            # Distinct from a safety block: the model spent its whole response
+            # token budget (which, pre-thinkingBudget=0 above, includes hidden
+            # "thinking" tokens on Flash models) before emitting any visible
+            # text. Should be rare now that Flash calls disable thinking, but
+            # can still happen on the Pro tier (which can't disable it) or on
+            # an unusually long/complex prompt -- mislabeling this as a safety
+            # block would send a user chasing the wrong fix.
+            raise GeminiAPIError(
+                "Gemini returned no visible text after exhausting its full response token budget "
+                "(finishReason=MAX_TOKENS) -- this is a token-budget exhaustion, not a safety "
+                "block (on Pro-tier models, or unusually long prompts, internal 'thinking' tokens "
+                "can consume the whole budget before any visible answer is written). Retrying "
+                "won't help by itself; a shorter prompt or a stronger/paid model is more likely to."
+            )
         raise GeminiAPIError(
             f"Gemini API returned no text (finishReason={finish_reason!r}) -- the prompt may have "
             f"been blocked by safety filters: {data!r}"
         )
     return text
+
+
+# UVA Research Computing's GenAI service: an Open WebUI front end over a
+# self-hosted Kimi K2.5 deployment (8x H200 GPUs) on the Rivanna/Afton HPC
+# systems. Only reachable by users with UVA RC HPC access and an API key
+# issued through RC's GenAI portal -- there is no public sign-up. Free (no
+# billing), capped at 60 requests/minute per RC's published limit. The
+# request/response shape below (OpenAI-style chat/completions body, SSE
+# streaming response) was confirmed against a real RC account, unlike
+# call_gemini's endpoint which is documented by Google.
+UVARC_GENAI_API_ENV_VAR = "UVARC_GenAI_API"  # matches RC's own published example variable name
+UVA_GENAI_BASE_URL_ENV_VAR = "UVA_GENAI_BASE_URL"
+UVA_GENAI_MODEL_ENV_VAR = "UVA_GENAI_MODEL"
+DEFAULT_UVA_GENAI_BASE_URL = "https://open-webui.rc.virginia.edu/api/chat/completions"
+DEFAULT_UVA_GENAI_MODEL = "Kimi K2.5"
+
+# How many times a 429 (per-minute rate limit) is waited out before giving up.
+# RC's cap is 60 requests/minute -- a short, fixed wait is enough to clear it
+# since (unlike Gemini's free tier) there's no separate per-day cap to worry
+# about.
+_UVA_GENAI_RATE_LIMIT_MAX_WAITS = 3
+_UVA_GENAI_RATE_LIMIT_DEFAULT_WAIT_S = 15.0
+
+
+def call_uva_genai(
+    prompt: str,
+    *,
+    system: str | None = None,
+    timeout: float = 300,
+    model: str | None = None,
+    on_wait: Callable[[float], None] | None = None,
+) -> str:
+    """Send `prompt` to UVA RC GenAI (Kimi K2.5) via its HTTPS API and return the
+    response text.
+
+    Free-tier alternative to call_claude for users with UVA Research Computing
+    HPC access: needs a UVARC_GenAI_API environment variable (issued through
+    RC's GenAI portal to accounts with Rivanna/Afton access -- there is no
+    public sign-up) instead of a Claude subscription or Gemini key. Endpoint
+    and model default to RC's current deployment; override with
+    UVA_GENAI_BASE_URL / UVA_GENAI_MODEL (or the `model=` argument) if RC
+    changes either.
+
+    `on_wait(seconds)`, if given, is called immediately before each internal
+    429 backoff sleep -- see call_gemini's docstring for why this matters to
+    a caller with its own progress log.
+    """
+    api_key = os.environ.get(UVARC_GENAI_API_ENV_VAR)
+    if not api_key:
+        raise UVAGenAIError(
+            f"No {UVARC_GENAI_API_ENV_VAR} environment variable set. UVA RC GenAI is only usable "
+            "by accounts with UVA Research Computing HPC access (Rivanna/Afton) -- request an API "
+            f"key through RC's GenAI portal, then set {UVARC_GENAI_API_ENV_VAR} before running "
+            "this again."
+        )
+
+    base_url = os.environ.get(UVA_GENAI_BASE_URL_ENV_VAR) or DEFAULT_UVA_GENAI_BASE_URL
+    resolved_model = model or os.environ.get(UVA_GENAI_MODEL_ENV_VAR) or DEFAULT_UVA_GENAI_MODEL
+    messages = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": "user", "content": prompt}
+    ]
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    request_body = {"model": resolved_model, "messages": messages}
+
+    rate_limit_waits = 0
+    while True:
+        try:
+            response = requests.post(
+                base_url, headers=headers, json=request_body, stream=True, timeout=timeout
+            )
+        except requests.RequestException as exc:
+            raise UVAGenAIError(f"UVA RC GenAI request failed: {exc}") from exc
+
+        if response.status_code == 429:
+            response.close()
+            if rate_limit_waits >= _UVA_GENAI_RATE_LIMIT_MAX_WAITS:
+                raise UVAGenAIError(
+                    "UVA RC GenAI's rate limit (60 requests/minute) still hit after waiting it out "
+                    f"{_UVA_GENAI_RATE_LIMIT_MAX_WAITS} times. Wait a few minutes and retry."
+                )
+            rate_limit_waits += 1
+            try:
+                delay = float(response.headers.get("Retry-After", _UVA_GENAI_RATE_LIMIT_DEFAULT_WAIT_S))
+            except ValueError:
+                delay = _UVA_GENAI_RATE_LIMIT_DEFAULT_WAIT_S
+            if on_wait:
+                on_wait(delay)
+            time.sleep(delay)
+            continue
+
+        if response.status_code != 200:
+            body_text = response.text
+            response.close()
+            raise UVAGenAIError(f"UVA RC GenAI returned HTTP {response.status_code}: {body_text}")
+
+        chunks: list[str] = []
+        with response:
+            for line in response.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data: "):
+                    continue
+                data = line.removeprefix("data: ").strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(data)["choices"][0].get("delta", {})
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                chunks.append(delta.get("content") or "")
+
+        text = "".join(chunks)
+        if not text:
+            raise UVAGenAIError(
+                "UVA RC GenAI returned no text in its streamed response -- the prompt may have been "
+                "blocked or the model produced an empty completion."
+            )
+        return text
