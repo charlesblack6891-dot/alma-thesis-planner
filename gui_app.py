@@ -7,9 +7,11 @@ One window with a "Generate a Paper..." button. Clicking it opens a form:
      Stage 10), restricted to unpublished (default), published, or both,
      per your choice -- the scientific-category/keyword dropdowns update to
      match whichever publication status is selected.
-  3. Choose an AI provider: Claude (default), or ChatGPT as a fallback for
-     when Claude usage/tokens run out (not implemented yet -- see
-     llm.call_chatgpt).
+  3. Choose an AI provider: Claude (default, requires a subscription or API
+     billing), Gemini (free API key, no billing required, but a less
+     capable/consistent writer and limited to the two non-download scopes --
+     see llm.call_gemini), or UVA RC GenAI (free, but only usable if you
+     already have UVA Research Computing HPC access -- see llm.call_uva_genai).
   4. Choose a Claude model (Fable 5 costs API credits; the rest are included
      with a Claude subscription). Only applies to the Claude provider.
   5. Choose scope: a fast single-pass Quick Summary, Idea + Methods only, or
@@ -34,15 +36,39 @@ import queue
 import sys
 import threading
 import tkinter as tk
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, scrolledtext, ttk
 
-if sys.stdout.encoding.lower() != "utf-8":
+# sys.stdout/stderr are None when launched via pythonw.exe (e.g. from a
+# desktop shortcut) -- there's no console to re-encode in that case.
+if sys.stdout is not None and sys.stdout.encoding.lower() != "utf-8":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+import app_state
+from llm import GEMINI_API_KEY_ENV_VAR, UVARC_GENAI_API_ENV_VAR
 from topic_lookup import available_categories_and_keywords, default_source_repo, list_candidates
-from wizard import MODELS, PROVIDERS, PUBLICATION_FILTERS, SCOPES, WizardConfig, _make_call_llm, generate, resolve
+from wizard import (
+    GEMINI_TIERS,
+    MODELS,
+    PROVIDERS,
+    PUBLICATION_FILTERS,
+    SCOPES,
+    WizardConfig,
+    _make_call_llm,
+    generate,
+    generate_plan_preview,
+    load_resumable_stages,
+    resolve,
+    resolve_project_dir,
+)
+
+# Stage key -> its state.py markdown filename, for rendering ResumePromptDialog
+# (mirrors wizard.py's private _STAGE_FILES, which load_resumable_stages()
+# already keys its dict by -- duplicated here rather than imported since
+# _STAGE_FILES is one of wizard.py's internal names).
+_RESUME_STAGE_FILENAMES = {"literature": "literature.md", "idea": "idea.md", "methods": "methods.md"}
 
 NGC4429_ALIASES = {"ngc4429", "ngc 4429"}
 
@@ -164,6 +190,121 @@ def _style_text(widget) -> None:
     )
 
 
+class PasswordGateDialog(tk.Toplevel):
+    """Modal password gate shown before MainWindow's content is built --
+    driven by MainWindow.__init__ via wait_window. Blocks until either a
+    password is set/verified (self.result = True) or the user cancels
+    (self.result = False, which ends the whole app -- see MainWindow.__init__).
+
+    First run (no password set yet): asks the user to set one. Every run
+    after that: asks for it, with unlimited retries -- this is a casual local
+    lock (see app_state's module docstring for the threat model), not a
+    security boundary that needs an attempt cap or lockout."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.result = False
+        self._first_run = not app_state.has_password()
+        self.title("Set a Password" if self._first_run else "Unlock ALMA Thesis Planner")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill="both", expand=True)
+        reset_note = (
+            f"Forgot it? Delete {app_state.AUTH_FILE} to reset -- your generation history is kept "
+            "separately and isn't affected."
+        )
+
+        if self._first_run:
+            ttk.Label(outer, text="Set a password to protect this app", style="Bold.TLabel").pack(anchor="w")
+            ttk.Label(
+                outer,
+                text="A single local password for this app on this computer -- it keeps out other "
+                     f"people who use the same PC, not a hardened account system. {reset_note}",
+                wraplength=380, style="Muted.TLabel",
+            ).pack(anchor="w", pady=(4, 12))
+
+            self.pw_var = tk.StringVar()
+            self.confirm_var = tk.StringVar()
+            row = ttk.Frame(outer)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text="Password:", width=14, anchor="w").pack(side="left")
+            first_entry = ttk.Entry(row, textvariable=self.pw_var, show="*")
+            first_entry.pack(side="left", fill="x", expand=True)
+            row2 = ttk.Frame(outer)
+            row2.pack(fill="x", pady=4)
+            ttk.Label(row2, text="Confirm:", width=14, anchor="w").pack(side="left")
+            ttk.Entry(row2, textvariable=self.confirm_var, show="*").pack(side="left", fill="x", expand=True)
+
+            self.error_label = ttk.Label(outer, text="", style="Danger.TLabel", wraplength=380)
+            self.error_label.pack(anchor="w", pady=(6, 0))
+
+            btns = ttk.Frame(outer)
+            btns.pack(pady=(14, 0))
+            ttk.Button(btns, text="Set Password", style="Accent.TButton", command=self._set).pack(side="left", padx=6)
+            ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="left", padx=6)
+            first_entry.focus_set()
+            self.bind("<Return>", lambda e: self._set())
+        else:
+            ttk.Label(outer, text="Enter password", style="Bold.TLabel").pack(anchor="w")
+            ttk.Label(outer, text=reset_note, wraplength=380, style="Muted.TLabel").pack(anchor="w", pady=(4, 12))
+
+            self.pw_var = tk.StringVar()
+            row = ttk.Frame(outer)
+            row.pack(fill="x", pady=4)
+            ttk.Label(row, text="Password:", width=14, anchor="w").pack(side="left")
+            entry = ttk.Entry(row, textvariable=self.pw_var, show="*")
+            entry.pack(side="left", fill="x", expand=True)
+
+            self.error_label = ttk.Label(outer, text="", style="Danger.TLabel", wraplength=380)
+            self.error_label.pack(anchor="w", pady=(6, 0))
+
+            btns = ttk.Frame(outer)
+            btns.pack(pady=(14, 0))
+            ttk.Button(btns, text="Unlock", style="Accent.TButton", command=self._verify).pack(side="left", padx=6)
+            ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="left", padx=6)
+            entry.focus_set()
+            self.bind("<Return>", lambda e: self._verify())
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        # Deliberately NOT self.transient(parent): `parent` (MainWindow) is
+        # withdrawn for the entire lifetime of this dialog (see
+        # MainWindow.__init__) -- confirmed live that tk's transient(),
+        # applied to an already-withdrawn master, leaves THIS window
+        # permanently in "withdrawn" state too (winfo_ismapped() stays 0
+        # even after an explicit deiconify()), so the gate would never
+        # actually appear on screen. grab_set() alone still gives the modal
+        # input-grab behavior this dialog needs; transient's benefit (window-
+        # manager stacking relative to its owner) is moot with no visible
+        # owner to stack against anyway.
+        self.grab_set()
+
+    def _set(self):
+        pw = self.pw_var.get()
+        if not pw:
+            self.error_label.configure(text="Password can't be empty.")
+            return
+        if pw != self.confirm_var.get():
+            self.error_label.configure(text="Passwords don't match.")
+            return
+        app_state.set_password(pw)
+        self.result = True
+        self.destroy()
+
+    def _verify(self):
+        if app_state.verify_password(self.pw_var.get()):
+            self.result = True
+            self.destroy()
+        else:
+            self.error_label.configure(text="Wrong password -- try again.")
+            self.pw_var.set("")
+
+    def _cancel(self):
+        self.result = False
+        self.destroy()
+
+
 class ConfirmSourceDialog(tk.Toplevel):
     """Modal dialog shown after search-mode picks a candidate, before any
     download/generation starts. Fields are editable in case the match (or
@@ -229,6 +370,123 @@ class ConfirmSourceDialog(tk.Toplevel):
         self.destroy()
 
 
+class PlanPreviewDialog(tk.Toplevel):
+    """Modal dialog shown (via WizardForm._run_worker/_poll_queue, same
+    cross-thread pattern as ConfirmSourceDialog) after the data source is
+    confirmed but before the expensive idea-loop/methods/writeup budget is
+    spent. Shows a cheap, short (3-4 sentence) plan preview and lets the user
+    decide whether to continue on that direction or regenerate a fresh one.
+
+    self.result: "continue" = proceed to full generation, "start_over" =
+    regenerate a new preview, None (Cancel/close) = abandon the run."""
+
+    def __init__(self, parent, plan_text: str):
+        super().__init__(parent)
+        self.title("Plan Preview")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self.result = None
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer, text="Here's a quick preview of the project direction", style="Bold.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text="A fast, single-pass sketch -- not the fully vetted idea. Review it before the "
+                 "full idea/methods run (several more Claude calls) starts.",
+            wraplength=460, style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 10))
+        ttk.Label(outer, text=plan_text, wraplength=460, justify="left").pack(anchor="w", pady=(0, 12))
+
+        btns = ttk.Frame(outer)
+        btns.pack(pady=(2, 0))
+        ttk.Button(btns, text="Looks good -- Continue", style="Accent.TButton", command=self._continue).pack(side="left", padx=6)
+        ttk.Button(btns, text="Start over", command=self._start_over).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.transient(parent)
+        self.grab_set()
+
+    def _continue(self):
+        self.result = "continue"
+        self.destroy()
+
+    def _start_over(self):
+        self.result = "start_over"
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
+class ResumePromptDialog(tk.Toplevel):
+    """Modal prompt shown (via WizardForm._run_worker/_poll_queue, same
+    cross-thread pattern as ConfirmSourceDialog) when this project directory
+    still has stages saved from an earlier, interrupted run. Lets the user
+    choose explicitly rather than wizard.generate() silently deciding on its
+    own -- see wizard.generate()'s `reuse_resumable` parameter.
+
+    self.result: True = reuse the saved stages, False = regenerate everything
+    from scratch, None = cancel the run entirely (parent expects to distinguish
+    all three)."""
+
+    def __init__(self, parent, project_dir: str, stage_names: list[str]):
+        super().__init__(parent)
+        self.title("Reuse Previous Progress?")
+        self.resizable(False, False)
+        self.configure(bg=BG)
+        self.result = None
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill="both", expand=True)
+
+        filenames = ", ".join(_RESUME_STAGE_FILENAMES[s] for s in stage_names)
+        ttk.Label(
+            outer, text="This project has unfinished progress saved", style="Bold.TLabel",
+        ).pack(anchor="w")
+        ttk.Label(
+            outer,
+            text=f"An earlier run of this project ({project_dir}) was interrupted before finishing, "
+                 f"but it already saved: {filenames}. That's OLD content from that earlier session, "
+                 "not anything new.",
+            wraplength=440, style="Muted.TLabel",
+        ).pack(anchor="w", pady=(4, 10))
+        ttk.Label(
+            outer,
+            text="Reuse it to skip the API calls for those stages (fast, free) -- or regenerate "
+                 "everything from scratch for a genuinely new result (spends API calls again, and "
+                 "overwrites the saved content above).",
+            wraplength=440, style="Muted.TLabel",
+        ).pack(anchor="w", pady=(0, 12))
+
+        btns = ttk.Frame(outer)
+        btns.pack(pady=(2, 0))
+        ttk.Button(btns, text="Reuse existing", style="Accent.TButton", command=self._reuse).pack(side="left", padx=6)
+        ttk.Button(btns, text="Regenerate from scratch", command=self._regenerate).pack(side="left", padx=6)
+        ttk.Button(btns, text="Cancel", command=self._cancel).pack(side="left", padx=6)
+
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+        self.transient(parent)
+        self.grab_set()
+
+    def _reuse(self):
+        self.result = True
+        self.destroy()
+
+    def _regenerate(self):
+        self.result = False
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None
+        self.destroy()
+
+
 class WizardForm(tk.Toplevel):
     def __init__(self, parent):
         super().__init__(parent)
@@ -240,6 +498,9 @@ class WizardForm(tk.Toplevel):
         self.mode_var = tk.StringVar(value="search")
         self.publication_filter_var = tk.StringVar(value=PUBLICATION_FILTERS[0][0])
         self.provider_var = tk.StringVar(value=PROVIDERS[0][0])
+        self.gemini_key_var = tk.StringVar(value=os.environ.get(GEMINI_API_KEY_ENV_VAR, ""))
+        self.gemini_tier_var = tk.StringVar(value=GEMINI_TIERS[0][0])
+        self.uva_genai_key_var = tk.StringVar(value=os.environ.get(UVARC_GENAI_API_ENV_VAR, ""))
         self.model_var = tk.StringVar(value=MODELS[0][0])
         self.scope_var = tk.StringVar(value="idea_methods")
         self.project_dir_var = tk.StringVar(value="")
@@ -267,6 +528,10 @@ class WizardForm(tk.Toplevel):
         self._msg_queue: "queue.Queue[tuple]" = queue.Queue()
         self._confirm_event = threading.Event()
         self._confirm_result = None
+        self._plan_event = threading.Event()
+        self._plan_choice = None  # "continue", "start_over", or None=cancel
+        self._resume_event = threading.Event()
+        self._resume_choice = None  # True=reuse, False=regenerate, None=cancel
         self._worker: threading.Thread | None = None
 
         self._build_form()
@@ -484,6 +749,49 @@ class WizardForm(tk.Toplevel):
                              command=self._toggle_provider).pack(anchor="w", pady=(2, 0))
             ttk.Label(provider_frame, text=note, style="Muted.TLabel", wraplength=600).pack(anchor="w", padx=22)
 
+        self.gemini_key_frame = ttk.Frame(provider_frame)
+        row = ttk.Frame(self.gemini_key_frame)
+        row.pack(fill="x", pady=3)
+        ttk.Label(row, text="Gemini API key:", width=32, anchor="w").pack(side="left")
+        ttk.Entry(row, textvariable=self.gemini_key_var, show="*", width=40).pack(side="left", fill="x", expand=True)
+        ttk.Label(
+            self.gemini_key_frame,
+            text="Get a key at https://aistudio.google.com/apikey. For a genuinely FREE key, create "
+                 "it in a project with NO billing account attached -- if the project behind the key "
+                 "has billing enabled (e.g. a spending cap set at ai.studio/spend), Google charges "
+                 "every call per token no matter which tier is selected below. Pasted here, the key "
+                 "is only kept for this app's process (used to set the "
+                 f"{GEMINI_API_KEY_ENV_VAR} environment variable) -- it's not written to disk. Leave "
+                 "blank to use an existing environment variable instead.",
+            style="Muted.TLabel", wraplength=600,
+        ).pack(anchor="w", pady=(0, 4))
+
+        ttk.Label(self.gemini_key_frame, text="Gemini usage tier:", style="Bold.TLabel").pack(
+            anchor="w", pady=(6, 0)
+        )
+        for tier_key, label, note in GEMINI_TIERS:
+            ttk.Radiobutton(
+                self.gemini_key_frame, text=label, variable=self.gemini_tier_var, value=tier_key,
+            ).pack(anchor="w", pady=(2, 0))
+            ttk.Label(self.gemini_key_frame, text=note, style="Muted.TLabel", wraplength=600).pack(
+                anchor="w", padx=22
+            )
+
+        self.uva_genai_key_frame = ttk.Frame(provider_frame)
+        row = ttk.Frame(self.uva_genai_key_frame)
+        row.pack(fill="x", pady=3)
+        ttk.Label(row, text="UVA RC GenAI API key:", width=32, anchor="w").pack(side="left")
+        ttk.Entry(row, textvariable=self.uva_genai_key_var, show="*", width=40).pack(side="left", fill="x", expand=True)
+        ttk.Label(
+            self.uva_genai_key_frame,
+            text="Requires UVA Research Computing HPC access (Rivanna/Afton) -- request a key through "
+                 "RC's GenAI portal; there is no public sign-up. Pasted here, the key is only kept for "
+                 f"this app's process (used to set the {UVARC_GENAI_API_ENV_VAR} environment "
+                 "variable) -- it's not written to disk. Leave blank to use an existing environment "
+                 "variable instead.",
+            style="Muted.TLabel", wraplength=600,
+        ).pack(anchor="w", pady=(0, 4))
+
         # --- model choice ---
         self.model_frame = ttk.LabelFrame(outer, text="Claude model", padding=12)
         self.model_frame.pack(fill="x", pady=(0, 12))
@@ -562,20 +870,33 @@ class WizardForm(tk.Toplevel):
             self.search_frame.pack(fill="x", pady=(6, 0))
 
     def _toggle_provider(self):
-        # ChatGPT isn't implemented yet (llm.call_chatgpt raises) and, even once it
-        # is, only ever covers idea+methods-shaped work -- 'Full paper' needs Claude
+        # Gemini only covers idea+methods-shaped work -- 'Full paper' needs Claude
         # for the real-data analysis writeup. Model choice is Claude-only too, so
-        # both are disabled rather than just left clickable-but-wrong.
-        is_chatgpt = self.provider_var.get() == "chatgpt"
-        model_state = "disabled" if is_chatgpt else "normal"
+        # both are disabled rather than just left clickable-but-wrong. UVA GenAI
+        # supports every scope (it's a general-purpose model like Claude), so it
+        # only needs the model-choice disable, not the scope restriction below.
+        provider = self.provider_var.get()
+        is_gemini = provider == "gemini"
+        is_uva_genai = provider == "uva_genai"
+        model_state = "disabled" if (is_gemini or is_uva_genai) else "normal"
         for child in self.model_frame.winfo_children():
             if isinstance(child, ttk.Radiobutton):
                 child.configure(state=model_state)
 
+        if is_gemini:
+            self.gemini_key_frame.pack(fill="x", pady=(4, 6))
+        else:
+            self.gemini_key_frame.pack_forget()
+
+        if is_uva_genai:
+            self.uva_genai_key_frame.pack(fill="x", pady=(4, 6))
+        else:
+            self.uva_genai_key_frame.pack_forget()
+
         full_paper_radio = self.scope_radios.get("full_paper")
         if full_paper_radio is not None:
-            full_paper_radio.configure(state="disabled" if is_chatgpt else "normal")
-        if is_chatgpt and self.scope_var.get() == "full_paper":
+            full_paper_radio.configure(state="disabled" if is_gemini else "normal")
+        if is_gemini and self.scope_var.get() == "full_paper":
             self.scope_var.set("quick_summary")
         self._toggle_scope()
 
@@ -620,11 +941,35 @@ class WizardForm(tk.Toplevel):
         scope = self.scope_var.get()
         provider = self.provider_var.get()
 
-        if provider == "chatgpt" and scope == "full_paper":
+        if provider == "gemini" and scope == "full_paper":
             raise ValueError(
-                "The ChatGPT provider doesn't support 'Full paper' scope -- switch the provider "
+                "The Gemini provider doesn't support 'Full paper' scope -- switch the provider "
                 "back to Claude, or pick 'Quick Summary' / 'Idea + Methods' instead."
             )
+
+        if provider == "gemini":
+            entered_key = self.gemini_key_var.get().strip()
+            if entered_key:
+                os.environ[GEMINI_API_KEY_ENV_VAR] = entered_key
+            elif not os.environ.get(GEMINI_API_KEY_ENV_VAR):
+                raise ValueError(
+                    "No Gemini API key given. Paste one into the 'Gemini API key' field above, or "
+                    f"set {GEMINI_API_KEY_ENV_VAR} as a Windows environment variable before launching "
+                    "this app. Get a free key (no billing/card required) at "
+                    "https://aistudio.google.com/apikey."
+                )
+
+        if provider == "uva_genai":
+            entered_key = self.uva_genai_key_var.get().strip()
+            if entered_key:
+                os.environ[UVARC_GENAI_API_ENV_VAR] = entered_key
+            elif not os.environ.get(UVARC_GENAI_API_ENV_VAR):
+                raise ValueError(
+                    "No UVA RC GenAI API key given. Paste one into the 'UVA RC GenAI API key' field "
+                    f"above, or set {UVARC_GENAI_API_ENV_VAR} as a Windows environment variable "
+                    "before launching this app. This provider only works if you already have UVA "
+                    "Research Computing HPC access -- request a key through RC's GenAI portal."
+                )
 
         publication_filter = self.publication_filter_var.get()
         category = self.category_vars[publication_filter].get().strip()
@@ -651,6 +996,7 @@ class WizardForm(tk.Toplevel):
             scope=scope,
             model=self.model_var.get(),
             provider=provider,
+            gemini_tier=self.gemini_tier_var.get(),
             prompt_text=prompt_text,
             category=category,
             keyword=keyword,
@@ -666,7 +1012,8 @@ class WizardForm(tk.Toplevel):
         )
 
     def _run_worker(self, cfg: WizardConfig):
-        cc = _make_call_llm(cfg.provider, cfg.model or None, lambda msg: self._msg_queue.put(("LOG", msg)))
+        cc = _make_call_llm(cfg.provider, cfg.model or None, lambda msg: self._msg_queue.put(("LOG", msg)),
+                            gemini_tier=cfg.gemini_tier)
         try:
             self._msg_queue.put(("LOG", "Resolving ALMA data source..."))
             resolved = resolve(cfg, call_claude_fn=cc)
@@ -684,7 +1031,73 @@ class WizardForm(tk.Toplevel):
                 resolved.target = self._confirm_result["target"]
                 resolved.data_description = self._confirm_result["data_description"]
 
-            result = generate(cfg, resolved, progress=lambda msg: self._msg_queue.put(("LOG", msg)))
+            # Cheap (one call, not the maker/hater loop) plan preview, shown
+            # for a like-it/start-over decision BEFORE the much larger
+            # idea-loop + methods + writeup budget below is spent. Skipped for
+            # "methods_only": that scope continues from an already-settled
+            # idea (see its own "no new plan is being made" branch further
+            # down), so there is no new plan to preview here.
+            if cfg.scope != "methods_only":
+                while True:
+                    self._msg_queue.put(("LOG", "Sketching a quick plan preview..."))
+                    plan_text = generate_plan_preview(resolved.data_description, call_claude_fn=cc)
+                    self._plan_event.clear()
+                    self._msg_queue.put(("PLAN_PREVIEW", plan_text))
+                    self._plan_event.wait()
+                    if self._plan_choice is None:
+                        self._msg_queue.put(("LOG", "Cancelled -- nothing generated."))
+                        self._msg_queue.put(("IDLE", None))
+                        return
+                    if self._plan_choice == "continue":
+                        break
+                    self._msg_queue.put(("LOG", "Starting over -- generating a new plan preview..."))
+
+            # "Methods only" already has its own, separate, self-documenting
+            # "continue from a saved idea" design -- the user picked that
+            # scope specifically to mean "continue", so it's excluded here to
+            # avoid asking about the exact same thing twice in different
+            # words. Every other scope goes through generate()'s auto-resume
+            # path (see wizard.generate()'s `reuse_resumable` docstring), so
+            # this is where any project with leftover interrupted-run stages
+            # gets caught, using the FINAL resolved project_code/target (after
+            # the search-mode confirm step above, since project_dir depends
+            # on them) -- not the LLM's initial pick, which the user may have
+            # just edited in ConfirmSourceDialog.
+            reuse_resumable = None
+            if cfg.scope != "methods_only":
+                project_dir_for_resume = resolve_project_dir(cfg, resolved)
+                resumable = load_resumable_stages(project_dir_for_resume)
+                if resumable:
+                    self._resume_event.clear()
+                    self._msg_queue.put(("RESUME_PROMPT", (project_dir_for_resume, sorted(resumable))))
+                    self._resume_event.wait()
+                    if self._resume_choice is None:
+                        self._msg_queue.put(("LOG", "Cancelled -- nothing generated."))
+                        self._msg_queue.put(("IDLE", None))
+                        return
+                    reuse_resumable = self._resume_choice
+
+            result = generate(
+                cfg, resolved, progress=lambda msg: self._msg_queue.put(("LOG", msg)),
+                reuse_resumable=reuse_resumable,
+            )
+            # Log every completed run -- "done", "partial" (an API failure
+            # mid-run, salvaged via generate()'s own _salvage_partial rather
+            # than raising), and "short_circuited" (already-published, no
+            # PDFs) all reach here with a real project_dir. A ValueError from
+            # resolve() above, or a hard RuntimeError generate() itself
+            # raises (e.g. a Galactic-scale distance), never reaches this
+            # line -- nothing was actually produced, so nothing is logged.
+            app_state.append_history_entry(app_state.HistoryEntry(
+                timestamp=datetime.now(timezone.utc).isoformat(),
+                provider=cfg.provider,
+                model=cfg.model or "(default)",
+                scope=cfg.scope,
+                project_code=result.resolved.project_code,
+                target=result.resolved.target,
+                project_dir=result.project_dir,
+                status=result.status,
+            ))
             self._msg_queue.put(("DONE", result))
         except Exception as exc:  # noqa: BLE001 -- surfaced to the user, not swallowed
             self._msg_queue.put(("ERROR", str(exc)))
@@ -700,6 +1113,17 @@ class WizardForm(tk.Toplevel):
                     self.wait_window(dialog)
                     self._confirm_result = dialog.result
                     self._confirm_event.set()
+                elif kind == "PLAN_PREVIEW":
+                    dialog = PlanPreviewDialog(self, payload)
+                    self.wait_window(dialog)
+                    self._plan_choice = dialog.result
+                    self._plan_event.set()
+                elif kind == "RESUME_PROMPT":
+                    project_dir_for_resume, stage_names = payload
+                    dialog = ResumePromptDialog(self, project_dir_for_resume, stage_names)
+                    self.wait_window(dialog)
+                    self._resume_choice = dialog.result
+                    self._resume_event.set()
                 elif kind == "IDLE":
                     self._set_running(False)
                 elif kind == "DONE":
@@ -724,8 +1148,27 @@ class WizardForm(tk.Toplevel):
             self._add_start_over_button()
             return
 
-        self._log(f"Done. {len(result.pdfs)} PDF(s) in {result.project_dir}")
-        ttk.Label(self.results_frame, text="Generated", style="Bold.TLabel").pack(anchor="w", pady=(0, 4))
+        if result.status == "partial":
+            self._log(f"Interrupted -- {len(result.pdfs)} PDF(s) salvaged in {result.project_dir}")
+            ttk.Label(
+                self.results_frame,
+                text="Run interrupted (API quota/failure) -- completed stages were saved.",
+                style="Danger.TLabel", wraplength=600,
+            ).pack(anchor="w")
+            ttk.Label(
+                self.results_frame,
+                text="Re-run the SAME data source once API access is back (e.g. after the Gemini "
+                     "free-tier daily reset at midnight US Pacific): saved stages are reused "
+                     "automatically, so API calls are only spent on what's missing.",
+                style="Muted.TLabel", wraplength=600,
+            ).pack(anchor="w", pady=(2, 4))
+            if not result.pdfs:
+                self._add_start_over_button()
+                return
+            ttk.Label(self.results_frame, text="Saved so far", style="Bold.TLabel").pack(anchor="w", pady=(0, 4))
+        else:
+            self._log(f"Done. {len(result.pdfs)} PDF(s) in {result.project_dir}")
+            ttk.Label(self.results_frame, text="Generated", style="Bold.TLabel").pack(anchor="w", pady=(0, 4))
         for pdf_path in result.pdfs:
             row = ttk.Frame(self.results_frame)
             row.pack(fill="x", anchor="w", pady=2)
@@ -764,6 +1207,9 @@ class WizardForm(tk.Toplevel):
         self.beginner_plan_var.set(False)
         self.mode_var.set("search")
         self.provider_var.set(PROVIDERS[0][0])
+        # Deliberately reset to the free tier -- leaving "paid" (pay-per-token)
+        # selected across a form reset risks silent charges on the next run.
+        self.gemini_tier_var.set(GEMINI_TIERS[0][0])
         self.scope_var.set("idea_methods")
         self._toggle_mode()
         self._toggle_provider()
@@ -783,12 +1229,112 @@ def _open_path(path: str):
         os.system(f'xdg-open "{path}"')
 
 
+# Provider/scope keys -> their display labels, for rendering app_state
+# history entries (which store the raw keys, e.g. "claude_free") the same way
+# the form itself presents them (e.g. "Claude -- free account").
+_PROVIDER_LABELS = {key: label for key, label, _note in PROVIDERS}
+_SCOPE_LABELS = {key: label for key, label, _note in SCOPES}
+
+
+def _format_history_timestamp(iso_utc: str) -> str:
+    """app_state stores timestamps as UTC ISO 8601; render in local time for
+    display. Falls back to the raw string for anything unparseable rather
+    than raising -- a malformed timestamp shouldn't hide the whole entry."""
+    try:
+        dt = datetime.fromisoformat(iso_utc)
+    except ValueError:
+        return iso_utc or "(unknown time)"
+    return dt.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+class HistoryWindow(tk.Toplevel):
+    """Read-only, newest-first list of past generations, backed by
+    app_state.load_history() -- one entry gets appended per completed run,
+    see WizardForm._run_worker."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.title("Generation History")
+        self.geometry("640x480")
+        self.minsize(480, 300)
+        self.configure(bg=BG)
+
+        outer = ttk.Frame(self, padding=16)
+        outer.pack(fill="both", expand=True)
+
+        entries = list(reversed(app_state.load_history()))  # newest first
+        if not entries:
+            ttk.Label(
+                outer,
+                text="No generations yet -- run \"Generate a Paper...\" and it'll show up here.",
+                style="Muted.TLabel", wraplength=560,
+            ).pack(anchor="w")
+            return
+
+        canvas = tk.Canvas(outer, bg=BG, highlightthickness=0)
+        vsb = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        vsb.pack(side="right", fill="y")
+
+        rows = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=rows, anchor="nw")
+        rows.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window_id, width=e.width))
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        canvas.bind("<Enter>", lambda e: canvas.bind_all("<MouseWheel>", _on_mousewheel))
+        canvas.bind("<Leave>", lambda e: canvas.unbind_all("<MouseWheel>"))
+
+        for entry in entries:
+            row = ttk.Frame(rows, padding=(4, 8))
+            row.pack(fill="x")
+            title = entry.get("target") or entry.get("project_code") or "(unknown target)"
+            ttk.Label(row, text=title, style="Bold.TLabel").pack(anchor="w")
+            when = _format_history_timestamp(entry.get("timestamp", ""))
+            provider = _PROVIDER_LABELS.get(entry.get("provider", ""), entry.get("provider") or "?")
+            scope = _SCOPE_LABELS.get(entry.get("scope", ""), entry.get("scope") or "?")
+            status = entry.get("status") or "?"
+            ttk.Label(
+                row, text=f"{when}   ·   {provider}   ·   {scope}   ·   {status}",
+                style="Muted.TLabel",
+            ).pack(anchor="w")
+
+            project_dir = entry.get("project_dir", "")
+            btn_row = ttk.Frame(row)
+            btn_row.pack(anchor="w", pady=(2, 0))
+            if project_dir and Path(project_dir).is_dir():
+                ttk.Button(
+                    btn_row, text="Open folder", command=lambda p=project_dir: _open_path(p),
+                ).pack(side="left")
+            else:
+                ttk.Label(
+                    btn_row, text="(project folder no longer on disk)", style="Muted.TLabel",
+                ).pack(side="left")
+
+            ttk.Separator(rows, orient="horizontal").pack(fill="x", pady=(4, 0))
+
+
 class MainWindow(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("ALMA Thesis Planner")
-        self.geometry("440x260")
+        self.geometry("440x300")
         _apply_dark_theme(self)
+
+        # Password gate before anything else is built or shown. The window
+        # stays withdrawn (not just covered by the dialog) while the gate is
+        # up, and stays withdrawn permanently -- process exits -- if the user
+        # cancels or the gate otherwise doesn't resolve to success.
+        self.withdraw()
+        gate = PasswordGateDialog(self)
+        self.wait_window(gate)
+        if not gate.result:
+            self.destroy()
+            sys.exit(0)
+        self.deiconify()
 
         frame = ttk.Frame(self, padding=24)
         frame.pack(fill="both", expand=True)
@@ -800,9 +1346,13 @@ class MainWindow(tk.Tk):
             wraplength=360, justify="center", style="Muted.TLabel",
         ).pack(pady=(0, 20))
         ttk.Button(frame, text="Generate a Paper...", style="Accent.TButton", command=self._open_form).pack()
+        ttk.Button(frame, text="View History", command=self._open_history).pack(pady=(8, 0))
 
     def _open_form(self):
         WizardForm(self)
+
+    def _open_history(self):
+        HistoryWindow(self)
 
 
 if __name__ == "__main__":

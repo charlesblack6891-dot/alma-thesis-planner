@@ -41,7 +41,15 @@ from blocks import extract_block
 from idea_loop import IdeaLoopResult, run_idea_loop, score_tractability
 from latex_paper import build_aastex_document, build_plain_document, compile_pdf
 from literature import LiteratureResult, check_published, parse_verdict
-from llm import ClaudeCLIError, GeminiAPIError, PAID_GEMINI_MODEL, call_claude, call_gemini
+from llm import (
+    ClaudeCLIError,
+    GeminiAPIError,
+    PAID_GEMINI_MODEL,
+    UVAGenAIError,
+    call_claude,
+    call_gemini,
+    call_uva_genai,
+)
 from methods import generate_methods
 from paper import assemble_paper_with_results
 from pipeline import run_pipeline
@@ -136,6 +144,13 @@ PROVIDERS: list[tuple[str, str, str]] = [
      "consistent at following this pipeline's multi-stage prompts than Claude -- treat its output "
      "as a rougher draft. Only supports the 'Quick Summary' and 'Idea + Methods' scopes -- 'Full "
      "paper' always requires Claude."),
+    ("uva_genai", "UVA RC GenAI (Kimi K2.5) -- free, requires HPC access",
+     "Uses UVA Research Computing's GenAI service (Kimi K2.5, a large open-source model run on RC's "
+     "own GPUs) instead of Claude or Gemini. Only usable if you already have UVA Research Computing "
+     "HPC access (a Rivanna/Afton account) -- request an API key through RC's GenAI portal, then set "
+     "the UVARC_GenAI_API environment variable before running. Free, no billing, but capped at 60 "
+     "requests/minute; a long run may need to wait out that cap partway through. Not available if "
+     "you don't already have RC HPC access -- there is no public sign-up."),
 ]
 
 # (tier key, display label, description) -- Gemini provider only. The tier
@@ -246,7 +261,10 @@ def _make_call_gemini(progress: Callable[[str], None], model: str | None = None)
     _make_call_claude's retry -- cheap insurance against a transient failure or a
     momentary free-tier rate-limit blip discarding an otherwise-fine run.
     `model` picks the Gemini model (free tier -> default flash, paid tier ->
-    pro); per-minute 429 waits happen inside call_gemini itself."""
+    pro). call_gemini waits out 503/429 transients internally (up to
+    ~3.5 minutes worst case across its own retries) -- on_wait below surfaces
+    each of those waits to `progress` so a long pause reads as "rate-limited,
+    waiting" instead of looking identical to a stall."""
     call_count = 0
 
     def _cc(prompt: str) -> str:
@@ -258,7 +276,10 @@ def _make_call_gemini(progress: Callable[[str], None], model: str | None = None)
             progress(f"  [gemini call {n}] sending ({len(prompt)} chars, model={model or 'default'}{suffix})...")
             start = time.monotonic()
             try:
-                result = call_gemini(prompt, timeout=CLAUDE_CALL_TIMEOUT_S, model=model)
+                result = call_gemini(
+                    prompt, timeout=CLAUDE_CALL_TIMEOUT_S, model=model,
+                    on_wait=lambda secs: progress(f"  [gemini call {n}] rate-limited -- waiting {secs:.0f}s..."),
+                )
             except GeminiAPIError as exc:
                 elapsed = time.monotonic() - start
                 if attempt < CLAUDE_CALL_MAX_ATTEMPTS:
@@ -273,6 +294,42 @@ def _make_call_gemini(progress: Callable[[str], None], model: str | None = None)
     return _cc
 
 
+def _make_call_uva_genai(progress: Callable[[str], None]) -> Callable[[str], str]:
+    """Same per-call progress logging as _make_call_claude, above, wrapping
+    llm.call_uva_genai instead. A single retry on UVAGenAIError mirrors the
+    other wrappers' retry -- cheap insurance against a transient failure or a
+    momentary rate-limit blip discarding an otherwise-fine run. call_uva_genai
+    waits out 429s internally (up to ~45s worst case across its own retries) --
+    on_wait below surfaces each of those waits to `progress`."""
+    call_count = 0
+
+    def _cc(prompt: str) -> str:
+        nonlocal call_count
+        call_count += 1
+        n = call_count
+        for attempt in range(1, CLAUDE_CALL_MAX_ATTEMPTS + 1):
+            suffix = f", attempt {attempt}/{CLAUDE_CALL_MAX_ATTEMPTS}" if attempt > 1 else ""
+            progress(f"  [uva_genai call {n}] sending ({len(prompt)} chars{suffix})...")
+            start = time.monotonic()
+            try:
+                result = call_uva_genai(
+                    prompt, timeout=CLAUDE_CALL_TIMEOUT_S,
+                    on_wait=lambda secs: progress(f"  [uva_genai call {n}] rate-limited -- waiting {secs:.0f}s..."),
+                )
+            except UVAGenAIError as exc:
+                elapsed = time.monotonic() - start
+                if attempt < CLAUDE_CALL_MAX_ATTEMPTS:
+                    progress(f"  [uva_genai call {n}] failed after {elapsed:.0f}s ({exc}) -- retrying")
+                    continue
+                progress(f"  [uva_genai call {n}] FAILED after {elapsed:.0f}s")
+                raise
+            progress(f"  [uva_genai call {n}] done in {time.monotonic() - start:.0f}s")
+            return result
+        raise AssertionError("unreachable")  # loop always returns or raises
+
+    return _cc
+
+
 def _make_call_llm(
     provider: str,
     model: str | None,
@@ -280,15 +337,17 @@ def _make_call_llm(
     *,
     gemini_tier: str = "free",
 ) -> Callable[[str], str]:
-    """Pick the right per-call wrapper for cfg.provider ("claude", "claude_free", or
-    "gemini"). "claude" and "claude_free" both go through the same `claude` CLI --
-    the only difference is which account you logged that CLI into (paid vs. free
-    claude.ai), which this code has no visibility into and can't enforce. `model`
-    is the Claude model id (ignored for Gemini); `gemini_tier` ("free" or "paid")
-    picks the Gemini model instead."""
+    """Pick the right per-call wrapper for cfg.provider ("claude", "claude_free",
+    "gemini", or "uva_genai"). "claude" and "claude_free" both go through the same
+    `claude` CLI -- the only difference is which account you logged that CLI into
+    (paid vs. free claude.ai), which this code has no visibility into and can't
+    enforce. `model` is the Claude model id (ignored for Gemini/UVA GenAI);
+    `gemini_tier` ("free" or "paid") picks the Gemini model instead."""
     if provider == "gemini":
         gemini_model = PAID_GEMINI_MODEL if gemini_tier == "paid" else None
         return _make_call_gemini(progress, gemini_model)
+    if provider == "uva_genai":
+        return _make_call_uva_genai(progress)
     return _make_call_claude(model, progress)
 
 
@@ -535,7 +594,7 @@ class WizardConfig:
     mode: str  # "manual" or "search"
     scope: str  # one of SCOPES[i][0]
     model: str  # one of MODELS[i][0], or "" for the claude CLI's own default
-    provider: str = "claude"  # one of PROVIDERS[i][0] ("claude", "claude_free", or "gemini")
+    provider: str = "claude"  # one of PROVIDERS[i][0] ("claude", "claude_free", "gemini", or "uva_genai")
     gemini_tier: str = "free"  # one of GEMINI_TIERS[i][0]; only read when provider == "gemini"
     prompt_text: str = ""  # search-mode topic; optional if category+keyword are given; kept for the record in manual mode too
     category: str = ""  # search-mode scientific category (required together with keyword)
@@ -572,6 +631,34 @@ def resolve(cfg: WizardConfig, *, call_claude_fn: Callable[[str], str]) -> Resol
             publication_filter=cfg.publication_filter, call_claude_fn=call_claude_fn,
         )
     return resolve_source_manual(cfg.project_code, cfg.pi, cfg.target, cfg.data_description)
+
+
+def plan_preview_prompt(data_description: str) -> str:
+    return f"""Based on the ALMA data description below, sketch a plan preview for a senior-thesis-scoped astronomy project. Write EXACTLY 3 to 4 sentences total, in plain language a beginner with no radio-astronomy background could follow: (1) one or two sentences on what question the project would investigate and why it matters; (2) one sentence on the general kind of ALMA data/approach that would be used; (3) ONLY if it genuinely applies, one blunt sentence flagging whether this plan would need information or data beyond ALMA, or beyond what's named in the data description -- if nothing like that applies, skip this sentence and stop at 3. This is a cheap, fast preview to confirm direction before the full idea is worked out in detail -- do not go into methodology, do not hedge, do not add a title or headers.
+
+Data description:
+{data_description}
+
+Respond in the following format:
+
+\\begin{{PLAN}}
+<PLAN>
+\\end{{PLAN}}
+
+In <PLAN>, put ONLY the 3-4 sentence preview -- no headers, no bullet points, no preamble, no closing remark."""
+
+
+def generate_plan_preview(
+    data_description: str,
+    *,
+    call_claude_fn: Callable[[str], str] = call_claude,
+) -> str:
+    """A single, cheap call (not the full maker/hater loop) that sketches a short
+    plan preview so a caller can show it to the user and get a like-it/start-over
+    decision BEFORE spending run_pipeline's much larger idea-loop + methods +
+    writeup budget on a direction they might not want."""
+    raw = call_claude_fn(plan_preview_prompt(data_description))
+    return extract_block(raw, "PLAN", repair_fn=call_claude_fn)
 
 
 _STAGE_FILES = {"literature": LITERATURE_FILE, "idea": IDEA_FILE, "methods": METHODS_FILE}
@@ -612,10 +699,15 @@ def _clear_incomplete_marker(project_dir: str) -> None:
     (input_files_dir(project_dir) / _INCOMPLETE_MARKER).unlink(missing_ok=True)
 
 
-def _load_resumable_stages(project_dir: str) -> dict[str, str]:
+def load_resumable_stages(project_dir: str) -> dict[str, str]:
     """If the previous run on this project was interrupted (marker present),
     return {stage: checkpointed content} for every stage it completed.
-    Empty dict otherwise -- costs no API calls either way."""
+    Empty dict otherwise -- costs no API calls either way.
+
+    Public (not just generate()'s internal helper) so a caller -- e.g.
+    gui_app.py -- can check for resumable content and ask the user whether to
+    reuse it *before* generate() is called, rather than generate() silently
+    deciding on its own. See generate()'s `reuse_resumable` parameter."""
     if not (input_files_dir(project_dir) / _INCOMPLETE_MARKER).exists():
         return {}
     stages = {}
@@ -698,15 +790,36 @@ def _salvage_partial(project_dir: str, resolved: ResolvedSource, exc: Exception,
     )
 
 
+def resolve_project_dir(cfg: WizardConfig, resolved: ResolvedSource) -> str:
+    """The project directory a run of `cfg`/`resolved` will use -- a pure,
+    deterministic function of the two, so a caller (gui_app.py) can compute
+    it *before* calling generate() (e.g. to check load_resumable_stages())
+    without any risk of it disagreeing with what generate() itself computes."""
+    return cfg.project_dir.strip() or (
+        f"project_{slugify(resolved.project_code)}_{slugify(resolved.target)}"
+        f"_{_short_hash(resolved.project_code, resolved.target)}"
+    )
+
+
 def generate(
     cfg: WizardConfig,
     resolved: ResolvedSource,
     *,
     progress: Callable[[str], None] = print,
+    reuse_resumable: bool | None = None,
 ) -> WizardResult:
     """The expensive step: literature check, idea/methods loop, PDF
     rendering, and (for full_paper scope) real ALMA download + analysis +
-    compiled paper PDF."""
+    compiled paper PDF.
+
+    `reuse_resumable` controls what happens when this project directory has
+    stages left over from an earlier, interrupted run (see
+    load_resumable_stages): None (default) auto-reuses them, matching this
+    function's original behavior, for callers that don't ask the user first.
+    True reuses them explicitly. False forces a fresh run, ignoring whatever
+    is on disk, even if it means overwriting an earlier interrupted run's
+    saved stages -- gui_app.py asks the user and passes True/False rather
+    than ever relying on the auto default."""
     if cfg.provider == "gemini" and cfg.scope == "full_paper":
         raise ValueError(
             "The Gemini provider only supports the 'Quick Summary' and 'Idea + Methods' scopes -- "
@@ -715,10 +828,7 @@ def generate(
         )
     cc = _make_call_llm(cfg.provider, cfg.model or None, progress, gemini_tier=cfg.gemini_tier)
 
-    project_dir = cfg.project_dir.strip() or (
-        f"project_{slugify(resolved.project_code)}_{slugify(resolved.target)}"
-        f"_{_short_hash(resolved.project_code, resolved.target)}"
-    )
+    project_dir = resolve_project_dir(cfg, resolved)
     Path(project_dir).mkdir(parents=True, exist_ok=True)
 
     # Determine the final output filenames now and confirm they're writable
@@ -765,7 +875,7 @@ def generate(
         _mark_run_incomplete(project_dir)
         try:
             methods_text = generate_methods(resolved.data_description, idea_text, call_claude_fn=cc)
-        except (GeminiAPIError, ClaudeCLIError) as exc:
+        except (GeminiAPIError, ClaudeCLIError, UVAGenAIError) as exc:
             return _salvage_partial(project_dir, resolved, exc, progress)
         write_state_file(project_dir, METHODS_FILE, methods_text + "\n")
         pdfs = [_render_plain_pdf(project_dir, f"Methods: {resolved.target}", methods_text,
@@ -777,7 +887,7 @@ def generate(
                     resolved.data_description, idea_text, methods_text, resolved.target,
                     call_claude_fn=cc,
                 )
-            except (GeminiAPIError, ClaudeCLIError) as exc:
+            except (GeminiAPIError, ClaudeCLIError, UVAGenAIError) as exc:
                 return _salvage_partial(project_dir, resolved, exc, progress)
             write_state_file(project_dir, BEGINNER_PLAN_FILE, beginner_text + "\n")
             pdfs.append(_render_plain_pdf(project_dir, f"Beginner's Guide: {resolved.target}",
@@ -806,15 +916,22 @@ def generate(
     # CLI failure), reuse every stage it already paid for -- zero API calls
     # for those stages. Gated on the incomplete-marker so re-running a
     # *completed* project still regenerates fresh output as before.
+    # reuse_resumable=False (the caller explicitly chose "regenerate from
+    # scratch") skips this lookup entirely, so a fresh run overwrites
+    # whatever was left over rather than reusing any of it.
     check_published_fn = partial(check_published, call_claude_fn=cc)
     run_idea_loop_fn = partial(run_idea_loop, call_claude_fn=cc)
     generate_methods_fn = partial(generate_methods, call_claude_fn=cc)
-    resume = _load_resumable_stages(project_dir)
+    resume = {} if reuse_resumable is False else load_resumable_stages(project_dir)
     if resume:
+        # Deliberately loud and explicit -- a quiet log line here is exactly
+        # what left the user unsure whether a fast run had actually done
+        # anything, since these stages are NOT being regenerated this run.
         progress(
-            "Resuming the interrupted run: reusing "
+            "REUSING OLD CONTENT from an earlier, interrupted run of this project: "
             + ", ".join(_STAGE_FILES[s] for s in sorted(resume))
-            + " -- no API calls are spent on these stages."
+            + ". These are NOT freshly generated this run -- no API calls are spent on them. "
+            "This is previously generated output being replayed, not new output."
         )
         if "literature" in resume:
             lit_raw = resume["literature"]
@@ -851,7 +968,7 @@ def generate(
             include_methods=(cfg.scope != "idea_only"),
             on_stage_complete=lambda stage, content: _checkpoint_stage(project_dir, stage, content, progress),
         )
-    except (GeminiAPIError, ClaudeCLIError) as exc:
+    except (GeminiAPIError, ClaudeCLIError, UVAGenAIError) as exc:
         return _salvage_partial(project_dir, resolved, exc, progress)
     progress(f"Publication verdict: {result.literature.verdict}")
 
@@ -897,7 +1014,7 @@ def generate(
                     resolved.data_description, result.idea, result.methods, resolved.target,
                     call_claude_fn=cc,
                 )
-            except (GeminiAPIError, ClaudeCLIError) as exc:
+            except (GeminiAPIError, ClaudeCLIError, UVAGenAIError) as exc:
                 return _salvage_partial(project_dir, resolved, exc, progress)
             write_state_file(project_dir, BEGINNER_PLAN_FILE, beginner_text + "\n")
             pdfs.append(_render_plain_pdf(project_dir, f"Beginner's Guide: {resolved.target}",
@@ -945,7 +1062,7 @@ def generate(
         progress("Looking up this target's distance and systemic velocity...")
         try:
             dv = lookup_distance_velocity(resolved.target, resolved.data_description, call_claude_fn=cc)
-        except (GeminiAPIError, ClaudeCLIError) as exc:
+        except (GeminiAPIError, ClaudeCLIError, UVAGenAIError) as exc:
             return _salvage_partial(project_dir, resolved, exc, progress)
         distance_mpc, systemic_velocity_kms = dv.distance_mpc, dv.systemic_velocity_kms
         distance_source_note = dv.source_note
@@ -1023,7 +1140,7 @@ def generate(
     progress("Writing real-results paper sections (several more Claude calls)...")
     try:
         sections = assemble_paper_with_results(result.idea, result.methods, result.literature.raw, results, call_claude_fn=cc)
-    except (GeminiAPIError, ClaudeCLIError) as exc:
+    except (GeminiAPIError, ClaudeCLIError, UVAGenAIError) as exc:
         return _salvage_partial(project_dir, resolved, exc, progress)
 
     progress("Assembling AASTeX document and compiling the paper PDF...")

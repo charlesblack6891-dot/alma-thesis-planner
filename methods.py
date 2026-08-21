@@ -17,13 +17,14 @@ def methods_prompt(data_description: str, idea: str) -> str:
     return f"""You are provided with a data description and an idea for a senior-thesis-scoped astronomy research project. Your task is to describe the methods a thesis student would use to carry it out.
 
 Follow these instructions:
+- begin with two short lead-in items, before the methods themselves: (1) a "Summary for a beginner" of 2-3 sentences stating the project's objective in plain language, understandable to someone with no radio-astronomy background; (2) a "Scope check" noting anything in the plan that may be too optimistic given the data description -- such as needing information, catalogs, follow-up observations, or expertise beyond ALMA or beyond what's named in the data description, which would be outside this project's scope. If nothing seems overly optimistic, say so briefly rather than omitting this item.
 - generate a detailed description of the methodology the student will use to perform the project.
 - the description should clearly outline the concrete steps, techniques, and tools, scoped to what's achievable in one thesis timeframe (a semester to a year).
 - stick to the data and tools available per the data description -- do not propose new instrumentation, additional observations, or data beyond what is described.
 - if you quote a wavelength, frequency, or other measurement that the data description caveated as rest-frame vs. observed-frame, approximate, or assumed, keep that same caveat -- do not present a value the data description called uncertain as if it were a settled, verified number.
 - the focus should be strictly on the methods and workflow for this specific project. Do **not** include discussion of future directions, future work, project extensions, or limitations.
 - write as if a senior researcher were explaining to her thesis student exactly how to carry out the work.
-- just provide the methods, do not add a sentence at the beginning about your thinking process.
+- aside from the two lead-in items above, just provide the methods -- do not add a sentence at the beginning about your thinking process.
 
 Data description:
 {data_description}

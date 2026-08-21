@@ -43,7 +43,11 @@ Respond in the following format:
 <IDEA>
 \\end{{IDEA}}
 
-In <IDEA>, put the idea together with a brief description. Do not explain how you addressed the criticism."""
+In <IDEA>, start with two short lead-in items before the idea description itself:
+1. "Summary for a beginner" -- 2-3 sentences stating the project's objective in plain language, understandable to someone with no radio-astronomy background.
+2. "Scope check" -- a brief, honest note on anything in the idea that may be too optimistic given the data description, such as needing information, catalogs, follow-up observations, or expertise beyond ALMA or beyond what's named in the data description -- which would be outside this project's scope. If you don't see anything overly optimistic, say so briefly rather than omitting this item.
+
+Then give the idea together with a brief description. Do not explain how you addressed the criticism."""
 
 
 def idea_hater_prompt(data_description: str, previous_ideas: str, idea: str) -> str:
