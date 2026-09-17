@@ -126,9 +126,15 @@ def novelty_prompt(
 ) -> str:
     return f"""You are checking whether a specific ALMA observing project's data has already been used in a published, peer-reviewed paper. You are given the project's own description and a set of real search results from Semantic Scholar for related terms. Determine the verdict from this evidence -- do not assume a predetermined answer either way.
 
-Be careful: a paper about the same astronomical target, or by an overlapping author, does NOT by itself mean this specific project's data was used -- the same target can have multiple independent ALMA datasets and publications. Only count a match as PUBLISHED if a search result plausibly analyzes data consistent with this project's specific description (the stated project code if it appears, the specific science goal/methods/wavelength described, and consistent author overlap) -- not just a shared target or a shared author.
+Be careful: a paper about the same astronomical target, or by an overlapping author, does NOT by itself mean this specific project's data was used -- the same target can have multiple independent ALMA datasets and publications. Apply this decision rule strictly. A verdict of PUBLISHED requires at least ONE of the following criteria to be met:
 
-Self-citation rule (apply this consistently, it is a common case): if the project description itself explicitly and specifically names a publication that reports analysis of THIS project's data -- e.g. it gives a DOI, journal/arXiv reference, or author list, and ties it to this project's specific code/target/method rather than just mentioning the target in passing -- treat that as sufficient evidence for PUBLISHED on its own. Do NOT downgrade to NOT_PUBLISHED or UNKNOWN merely because Semantic Scholar returned zero corroborating results; Semantic Scholar's index lags recent publications and a specific, well-formed self-citation is stronger evidence than an empty search. Only discount the description's own citation if the search results (or the description itself) affirmatively contradict it -- e.g. the cited work turns out to be about a different dataset, or the description's citation is vague/unverifiable (no DOI, no specific journal, just "this has probably been studied before"). A vague, non-specific mention should NOT be treated as sufficient on its own; a specific, well-formed one should.
+(a) A search result explicitly names this ALMA project code.
+(b) A search result reports analysis of observations matching this project's specific description -- the same instrument configuration, band/frequency/line, AND the same target(s) or sample -- and presents measurements that could only have come from those observations. A paper that merely studies the same class of objects, motivates or proposes such observations, or presents a precursor/companion study does NOT meet this criterion.
+(c) The self-citation rule below applies.
+
+PI or co-author overlap combined with similar science goals is NOT sufficient for any criterion: research groups routinely publish precursor surveys, sample-selection papers, and companion studies that share authors and goals with a proposal but do not use the proposal's data. A paper whose abstract could have been written before this project's observations existed must not be counted. If none of (a), (b), or (c) is met, the verdict is NOT_PUBLISHED.
+
+Self-citation rule (apply this consistently, it is a common case): if the project description itself explicitly and specifically names a publication that reports analysis of THIS project's data -- e.g. it gives a DOI, journal/arXiv reference, or author list, and ties it to this project's specific code/target/method rather than just mentioning the target in passing -- treat that as sufficient evidence for PUBLISHED on its own. However, the standard ALMA acknowledgement template ("This paper makes use of the following ALMA data: ADS/JAO.ALMA#...") is boilerplate text the archive attaches to every project's metadata regardless of publication status -- it is NOT a citation of an actual publication and must be ignored entirely for this rule. A self-citation only counts if it names an actual publication (authors, journal/arXiv reference, or DOI). Do NOT downgrade to NOT_PUBLISHED or UNKNOWN merely because Semantic Scholar returned zero corroborating results; Semantic Scholar's index lags recent publications and a specific, well-formed self-citation is stronger evidence than an empty search. Only discount the description's own citation if the search results (or the description itself) affirmatively contradict it -- e.g. the cited work turns out to be about a different dataset, or the description's citation is vague/unverifiable (no DOI, no specific journal, just "this has probably been studied before"). A vague, non-specific mention should NOT be treated as sufficient on its own; a specific, well-formed one should.
 
 ALMA project code: {project_code}
 PI: {pi}
@@ -137,13 +143,14 @@ Target: {target}
 Project description:
 {data_description}
 
-Semantic Scholar search results:
+Semantic Scholar search results (every result below is an already-indexed, already-published or publicly posted work -- do not discount a result because its year seems recent or later than you expect; your knowledge of the current date may be out of date):
 {_format_hits(search_results)}
 
 Respond in the following format:
 
 \\begin{{LITERATURE}}
 VERDICT: PUBLISHED or NOT_PUBLISHED
+EVIDENCE: <which of criteria (a), (b), or (c) is met and by which search result or citation -- or "NONE" if none are met>
 JUSTIFICATION: <1-3 sentences explaining the verdict, referencing which search result(s) it's based on, or why none of the results are a match>
 CITATIONS:
 <numbered list of the most relevant results as background reading -- title/authors/year/url; write "(none directly relevant)" if none qualify>
@@ -175,16 +182,24 @@ def check_published(
     prompt = novelty_prompt(project_code, pi, target, data_description, hits)
     raw = call_claude_fn(prompt)
     block = extract_block(raw, "LITERATURE", repair_fn=call_claude_fn)
+    return LiteratureResult(verdict=parse_verdict(block), raw=block)
 
-    verdict = "UNKNOWN"
+
+def parse_verdict(block: str) -> str:
+    """Parse the VERDICT line out of a LITERATURE block ("PUBLISHED",
+    "NOT_PUBLISHED", or "UNKNOWN" if none found). Split out of check_published
+    so a checkpointed literature.md can be re-parsed on resume without
+    re-spending the API call that produced it."""
     for line in block.splitlines():
-        stripped = line.strip().upper()
-        if stripped.startswith("VERDICT:"):
+        # Tolerate markdown decoration around the label (e.g. "**VERDICT:** X",
+        # "- VERDICT: X") -- weaker models add it despite the format instructions,
+        # and a cosmetic mismatch here must not read as an UNKNOWN verdict.
+        stripped = line.strip().upper().lstrip("*#-_` ").lstrip()
+        if stripped.startswith("VERDICT") and ":" in stripped:
             v = stripped.split(":", 1)[1].strip()
             if "NOT_PUBLISHED" in v or "NOT PUBLISHED" in v:
-                verdict = "NOT_PUBLISHED"
-            elif "PUBLISHED" in v:
-                verdict = "PUBLISHED"
+                return "NOT_PUBLISHED"
+            if "PUBLISHED" in v:
+                return "PUBLISHED"
             break
-
-    return LiteratureResult(verdict=verdict, raw=block)
+    return "UNKNOWN"

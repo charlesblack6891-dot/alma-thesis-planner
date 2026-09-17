@@ -104,6 +104,7 @@ def run_pipeline(
     generate_methods_fn: Callable[..., str] = generate_methods,
     assemble_writeup_fn: Callable[..., str] = assemble_writeup,
     include_writeup: bool = True,
+    include_methods: bool = True,
     on_stage_complete: Callable[[str, str], None] | None = None,
 ) -> PipelineResult:
     """Run the full Stage 9 pipeline for one project, branching on Stage 6's verdict.
@@ -143,6 +144,20 @@ def run_pipeline(
         on_stage_complete("idea", idea_result.final_idea)
 
     score = score_tractability_fn(data_description, idea_result.final_idea)
+
+    # include_methods=False mirrors include_writeup=False (wizard.py's
+    # "Idea only" scope): skip the methods call entirely rather than spending
+    # it on output the caller won't use. Writeup needs methods, so it's
+    # forced off too.
+    if not include_methods:
+        return PipelineResult(
+            literature=lit_result,
+            short_circuited=False,
+            writeup="",
+            idea=idea_result.final_idea,
+            methods=None,
+            tractability_score=score,
+        )
 
     methods = generate_methods_fn(data_description, idea_result.final_idea)
     if on_stage_complete:

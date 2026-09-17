@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 AASTEX_CLASS = "aastex701"
@@ -42,10 +43,13 @@ def _escape_latex(text: str) -> str:
     # pass above so the inserted "$...$" isn't itself re-escaped.
     unicode_replacements = [
         ("α", r"$\alpha$"), ("β", r"$\beta$"), ("γ", r"$\gamma$"), ("δ", r"$\delta$"),
-        ("ε", r"$\epsilon$"), ("θ", r"$\theta$"), ("λ", r"$\lambda$"), ("μ", r"$\mu$"),
-        ("ν", r"$\nu$"), ("π", r"$\pi$"), ("ρ", r"$\rho$"), ("σ", r"$\sigma$"),
-        ("τ", r"$\tau$"), ("φ", r"$\phi$"), ("χ", r"$\chi$"), ("ψ", r"$\psi$"), ("ω", r"$\omega$"),
-        ("Δ", r"$\Delta$"), ("Σ", r"$\Sigma$"), ("Ω", r"$\Omega$"),
+        ("ε", r"$\epsilon$"), ("ζ", r"$\zeta$"), ("η", r"$\eta$"), ("θ", r"$\theta$"),
+        ("ι", r"$\iota$"), ("κ", r"$\kappa$"), ("λ", r"$\lambda$"), ("μ", r"$\mu$"),
+        ("ν", r"$\nu$"), ("ξ", r"$\xi$"), ("π", r"$\pi$"), ("ρ", r"$\rho$"), ("σ", r"$\sigma$"),
+        ("τ", r"$\tau$"), ("υ", r"$\upsilon$"), ("φ", r"$\phi$"), ("χ", r"$\chi$"), ("ψ", r"$\psi$"), ("ω", r"$\omega$"),
+        ("Γ", r"$\Gamma$"), ("Δ", r"$\Delta$"), ("Θ", r"$\Theta$"), ("Λ", r"$\Lambda$"),
+        ("Ξ", r"$\Xi$"), ("Π", r"$\Pi$"), ("Σ", r"$\Sigma$"), ("Φ", r"$\Phi$"),
+        ("Ψ", r"$\Psi$"), ("Ω", r"$\Omega$"),
         ("⊙", r"$\odot$"),
         ("≳", r"$\gtrsim$"), ("≲", r"$\lesssim$"), ("≥", r"$\geq$"), ("≤", r"$\leq$"),
         ("≈", r"$\approx$"), ("≡", r"$\equiv$"),
@@ -240,6 +244,8 @@ def build_plain_document(
     return f"""\\documentclass[11pt]{{article}}
 \\usepackage[margin=1in]{{geometry}}
 \\usepackage{{parskip}}
+\\usepackage{{amsmath}}
+\\usepackage{{amssymb}}
 
 \\title{{{_inline_markdown(_escape_latex(title))}}}
 \\author{{{_escape_latex(author)}}}
@@ -278,6 +284,12 @@ def compile_pdf(tex_content: str, out_dir: str | Path, basename: str = "paper", 
         else:
             raise RuntimeError("xelatex not found on PATH -- is MiKTeX/TeX Live installed?")
 
+    # Same console-subsystem-app-under-a-console-less-parent issue as llm.py's
+    # claude CLI call: without CREATE_NO_WINDOW, running this from gui_app.py
+    # under pythonw.exe pops up a visible console window for xelatex even
+    # though its output is fully piped.
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
     last_result = None
     for _ in range(n_passes):
         last_result = subprocess.run(
@@ -289,6 +301,7 @@ def compile_pdf(tex_content: str, out_dir: str | Path, basename: str = "paper", 
             encoding="utf-8",
             errors="replace",
             timeout=120,
+            creationflags=creationflags,
         )
 
     pdf_path = out_dir / f"{basename}.pdf"
